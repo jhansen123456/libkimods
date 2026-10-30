@@ -1,15 +1,34 @@
-# [Part 1/2] Review multiple held print jobs and collect cash before release
+# [Part 1/2] Add staff print selection, copy quantities, and cash review
 
-Staff currently needs a clearer review step when collecting cash for several held jobs. This change adds selection, per-job copy quantities, a combined amount due, cash confirmation and individual release results. Additional reprints use their own review.
+Submitted as [upstream draft PR #508](https://github.com/Libki/libki-server/pull/508). This is a draft for feedback and further validation, not an official Libki release.
 
-Supporting changes validate current prices, claim jobs before submission, and distinguish safe failures from uncertain results. See SCREENSHOTS.md for the workflow with sample data.
+Staff collecting cash for several held print jobs need a single review of the documents, quantities, and amount due. This change lets staff select jobs, adjust copies per job, confirm the combined cash amount, and review each release result. Reprints require a separate review and cash confirmation.
 
-Validation: five focused Perl test files passed (47 top-level tests/subtests), plus browser coverage for quantity changes, selection limits, cash reset, reprints, partial failures and repeat submissions. Production printers and payments were not used. Existing API/payment compatibility remains a review item.
+### Included
 
-Part 2 is planned as a separate companion mobile-print contribution. This part focuses on staff cash collection.
+- Select up to 20 held jobs on the current page and set 1–99 copies per job.
+- Recalculate prices and reset cash confirmation when quantities change.
+- Release jobs sequentially with separate success, failure, or uncertain outcomes.
+- Revalidate prices and location on the server, conditionally claim jobs before submission, and guard repeat release and accounting.
+- Focused regression tests and [review documentation](https://github.com/jhansen123456/libki-server/blob/codex/staff-print-cash/docs/staff-cash-printing.md).
 
-## Contributor context
+### Screenshots
 
-I am a Network and Systems Administrator in Information Technologies supporting Clinton Public Library in Clinton, Iowa. We have used Libki for about three months to replace EnvisionWare. I am not a programmer, but I developed these changes with Codex and would like to contribute them if useful to the project.
+[Seven screenshots with feature captions](https://github.com/jhansen123456/libkimods/blob/b8e7b4e80422a05353e6ad9097d867f4aa73a737/contributions/printing/part-1-staff-print-cash/SCREENSHOTS.md)
 
-Draft upstream submission text; not sent to maintainers.
+![Per-document copies and combined cash total](https://raw.githubusercontent.com/jhansen123456/libkimods/b8e7b4e80422a05353e6ad9097d867f4aa73a737/contributions/printing/part-1-staff-print-cash/screenshots/03-staff-per-document-copies.png)
+
+The screenshots show the exported UI with fabricated records and intercepted HTTP, not patron records or live printing.
+
+### Validation
+
+Five focused Perl test files passed (47 top-level tests/subtests), including in-memory database acceptance, release, cancellation, and accounting. Browser checks passed for quantities, selection limits, price recalculation, cash reset, reprints, partial failures, repeat-click protection, and expired sessions. Production printers and payments were not used.
+
+The unchanged source was extracted onto upstream 6acf2d1327efcae92fda3509163a9a1da54b99f2. The export passed Gitleaks and targeted disclosure checks; no private Git history, production configuration, credentials, or patron documents are included.
+
+### Draft review boundaries
+
+Staff release now requires POST and cash confirmation. CUPS release is gated by `staff_print_release: enabled` in printer configuration. Compatibility with account payments, public self-service printing, external API callers, and the opt-in behavior needs review before general deployment. Print-system acceptance does not confirm physical output.
+
+This is Part 1 of two separate printing contributions. It can review existing held jobs without the proposed companion mobile service. Maintainer feedback on the API and payment-flow design is welcome.
+

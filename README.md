@@ -8,7 +8,7 @@ Focused, reusable additions for [Libki Server](https://github.com/Libki/libki-se
 
 ## Printing contributions — review drafts
 
-The printing packages are available here for review and have not been submitted to the main Libki project.
+The printing packages have been submitted to the main Libki project as [Part 1 draft PR #508](https://github.com/Libki/libki-server/pull/508) and [Part 2 draft PR #509](https://github.com/Libki/libki-server/pull/509). Both remain drafts for maintainer feedback and further validation; neither has been merged.
 
 | Contribution | Description and code | Screenshots |
 | --- | --- | --- |

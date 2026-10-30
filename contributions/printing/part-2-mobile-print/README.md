@@ -1,6 +1,6 @@
 # Part 2: Companion mobile printing service
 
-**Published here for review. Not submitted to the main Libki project.** Proposed after Part 1 is published. Part 2 has not yet been submitted, approved or merged.
+**Submitted as [upstream draft PR #509](https://github.com/Libki/libki-server/pull/509).** It remains a draft for design and implementation feedback; it has not been approved or merged.
 
 This service lets a patron upload documents from a phone or computer without a library card, receive a release code and amount due, then pay staff at pickup. Libki already provides web uploads and printing; this contribution adds our companion service and guest workflow.
 

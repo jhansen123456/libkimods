@@ -1,6 +1,6 @@
 # Validation and sanitization
 
-Status: Part 1 — Staff printing and cash collection. Published in libkimods for review; not submitted upstream.
+Status: Part 1 — Staff printing and cash collection. Submitted as [upstream draft PR #508](https://github.com/Libki/libki-server/pull/508); draft, not merged.
 
 Source and screenshots are unchanged from the validated combined draft. This step reorganizes the files and documentation into separate contributions; it does not introduce new feature behavior.
 
@@ -29,4 +29,4 @@ The test environment emitted Catalyst mock-context / SQLite datatype warnings an
 
 The staff changes require compatibility review for existing payment workflows and the release API. Mobile printing still needs generic deployment configuration and verification of its Libki intake integration. Do not describe this snapshot as a drop-in installation.
 
-Automated scanning is evidence, not a guarantee that all sensitive data or security problems have been found. The screenshots were also visually reviewed. Submission to the main Libki project still waits for Josh's review.
+Automated scanning is evidence, not a guarantee that all sensitive data or security problems have been found. The screenshots were also visually reviewed. The sanitized source was extracted onto clean upstream branches, checked again with Gitleaks and targeted disclosure scans, and submitted as a draft. The source behavior and screenshots are unchanged; deployment and compatibility work remains as described above.

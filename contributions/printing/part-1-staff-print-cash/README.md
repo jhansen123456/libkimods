@@ -1,6 +1,6 @@
 # Part 1: Staff print selection and cash collection
 
-**Published here for review. Not submitted to the main Libki project.** This is the first contribution in a two-part printing series.
+**Submitted as [upstream draft PR #508](https://github.com/Libki/libki-server/pull/508).** This is the first contribution in a two-part printing series. It remains a draft and has not been merged.
 
 ## What staff gains
 
@@ -17,9 +17,9 @@ Supporting server changes include price revalidation, location checks, condition
 
 The changes directory contains changed files only. Apply staff-pay-print.patch to a clean upstream Libki/libki-server checkout at commit 6acf2d1327efcae92fda3509163a9a1da54b99f2. It contains no City Git history or deployment settings.
 
-Part 1 does not require the Part 2 mobile upload service to demonstrate staff selection and cash review with existing held jobs. Part 2 is a later, separate contribution.
+Part 1 does not require the Part 2 mobile upload service to demonstrate staff selection and cash review with existing held jobs. Part 2 is a [separate draft contribution](https://github.com/Libki/libki-server/pull/509).
 
-## Review before submission
+## Review before general deployment
 
 Review compatibility with existing account payments, public self-service printing and external API callers. Staff release now requires POST and cash confirmation; CUPS release is gated by staff_print_release: enabled in printer configuration. Confirm this opt-in behavior is appropriate for upstream before presenting it as a general release.
 
