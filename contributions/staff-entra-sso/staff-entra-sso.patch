@@ -1,0 +1,1548 @@
+diff --git a/Makefile.PL b/Makefile.PL
+index 82f7a20..251dc83 100644
+--- a/Makefile.PL
++++ b/Makefile.PL
+@@ -27,6 +27,9 @@ requires 'CatalystX::Script::Server::Starman';
+ requires 'Catalyst::Controller::REST';
+ 
+ requires 'Catalyst::Plugin::Authentication';
++requires 'Catalyst::Plugin::OIDC' => '1.05';
++requires 'OIDC::Client' => '1.08';
++requires 'Crypt::PRNG' => '0.085';
+ requires 'Catalyst::Authentication::Realm::SimpleDB';
+ requires 'Catalyst::Plugin::Authorization::Roles';
+ 
+diff --git a/cpanfile b/cpanfile
+index ecd4501..19d0aee 100644
+--- a/cpanfile
++++ b/cpanfile
+@@ -69,3 +69,8 @@ requires 'Test::Pod';
+ requires 'Test::Pod::Coverage';
+ requires 'Text::CSV';
+ requires 'YAML::XS';
++
++# Staff Entra SSO (disabled unless explicitly configured).
++requires 'Catalyst::Plugin::OIDC', '>=1.05';
++requires 'OIDC::Client', '>=1.08';
++requires 'Crypt::PRNG', '>=0.085';
+diff --git a/docs/staff-entra-sso.md b/docs/staff-entra-sso.md
+new file mode 100644
+index 0000000..a276e9c
+--- /dev/null
++++ b/docs/staff-entra-sso.md
+@@ -0,0 +1,169 @@
++# Staff Microsoft Entra single sign-on — draft contribution
++
++Optional staff authentication for one Microsoft Entra workforce tenant.
++When enabled, /administration/login starts Microsoft sign-in automatically.
++An existing Microsoft browser session can provide SSO, subject to tenant policy.
++Patron authentication is unchanged. No Libki client modification is required.
++
++This is a proposal for upstream review. The deployment-specific version has been
++used at Clinton Public Library, Iowa. This portable export includes additional
++session and error-handling changes and has not had a live Entra acceptance test.
++Deployment experience does not validate this exact export.
++
++## Authorization
++
++The OIDC dependency handles authorization-code exchange, state, nonce, PKCE S256,
++signature, issuer, audience, timestamps and authorized-party validation.
++Libki then requires the configured tenant ID, an object ID, and an explicit role
++or configured group assignment. Email and display name never grant access.
++
++| Entra app-role value | Libki roles | Purpose |
++| --- | --- | --- |
++| Libki.Staff | admin | Normal staff administration |
++| Libki.Admin | admin, superadmin | Full administration |
++
++Administrator assignments win when both levels match. Optional group IDs can
++grant either level as well; leave them unset when using only app roles.
++Group-overage claims without a matching app role are denied. No Microsoft Graph
++group lookup is performed. An assigned guest in the configured tenant can qualify;
++manage eligible identities through enterprise application assignments.
++
++Accounts use entra-<object-id> in the current Libki instance. Their random initial
++password is not provided to staff, and the administration password route rejects
++that namespace. Local accounts are never converted into Entra accounts. Locally
++disabled Entra accounts remain disabled. Managed admin and superadmin roles are
++reconciled on sign-in, including removal of superadmin on downgrade. Other Libki
++roles are unchanged.
++
++## Prerequisites
++
++Install dependencies using the project's cpanfile or Makefile.PL workflow and a
++compatible Perl runtime. Tested here: Perl 5.40.1, Catalyst::Plugin::OIDC 1.05 and
++OIDC::Client 1.08.
++
++Use HTTPS, a fixed trusted staff hostname, and the existing server-side DBIC
++session store. At the reverse proxy, reject unexpected Host values and replace
++forwarding headers from untrusted clients; redirect URLs use the request base.
++Set secure, HttpOnly session cookies and a SameSite policy compatible with the
++authorization-code callback. Restrict database/session-store access. Disable
++Catalyst/OIDC debug logging and exclude callback query strings and request bodies
++from proxy/application access logs.
++
++Outbound TLS access to Microsoft's discovery, signing-key and token endpoints is
++required. Enabled startup needs discovery access; failure prevents startup.
++Maintain a tested way to disable SSO and restart, as well as a local recovery
++account, for outages that prevent startup.
++
++## Entra registration
++
++1. Register a **single-tenant** application in your workforce directory.
++2. Add a **Web** redirect URI:
++   https://staff.example.org/oidc/entra/callback
++   using your trusted staff origin instead of the example. Use an exact URI;
++   do not enable implicit token grants or public-client flows.
++3. Define enabled user app roles with values **Libki.Staff** and **Libki.Admin**.
++   Assign staff through the enterprise application's Users and groups page.
++   Enable **Assignment required** as an additional restriction.
++4. Create a client secret and inject its **value** into the server environment
++   as **OIDC_ENTRA_SECRET**. Never commit it. Track expiration and rotate using
++   your deployment's secret-management process.
++5. Set your tenant and application IDs. Apply MFA and Conditional Access through
++   tenant policy as appropriate. Libki does not independently enforce MFA.
++
++Only openid, profile and email scopes are requested. This implementation does not
++call Microsoft Graph or request offline_access.
++
++References:
++- [Register an application](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)
++- [Define and assign app roles](https://learn.microsoft.com/en-us/entra/identity-platform/howto-add-app-roles-in-apps)
++- [Group claims and app roles](https://learn.microsoft.com/en-us/security/zero-trust/develop/configure-tokens-group-claims-app-roles)
++- [Catalyst OIDC integration](https://metacpan.org/pod/Catalyst::Plugin::OIDC)
++
++## Settings
++
++These are synthetic examples, not a usable tenant registration:
++
++~~~text
++LIBKI_ENTRA_ENABLED=1
++LIBKI_ENTRA_TENANT_ID=11111111-2222-4333-8444-555555555555
++LIBKI_ENTRA_CLIENT_ID=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
++LIBKI_ENTRA_ADMIN_APP_ROLE=Libki.Admin
++LIBKI_ENTRA_STAFF_APP_ROLE=Libki.Staff
++~~~
++
++Supply OIDC_ENTRA_SECRET separately. Optional group settings default to empty:
++
++~~~text
++LIBKI_ENTRA_ADMIN_GROUP_ID=
++LIBKI_ENTRA_STAFF_GROUP_ID=
++~~~
++
++For group fallback, configure Entra to issue group object IDs in the ID token
++and set the corresponding GUIDs. Prefer app roles to avoid group overage.
++Invalid tenant/client/nonempty group IDs or missing required credentials fail
++at startup. With LIBKI_ENTRA_ENABLED unset or false, normal local staff login
++remains and no tenant registration is required.
++
++The registration is process-wide, not per Libki instance. Keep the tenant fixed:
++shadow usernames contain the object ID, not the tenant ID. A tenant migration
++requires an account and role review. Local libki.conf settings can override
++defaults; never add mocked identities or weaken OIDC verification in production.
++
++## Sessions, logout and recovery
++
++/administration/login/emergency keeps existing local password login available.
++Protect those accounts under your password and access policy; this route is not
++protected by Entra MFA or Conditional Access. Credentials are accepted through
++POST. Recovery logins are audited.
++
++The session ID changes at authentication. After a verified identity becomes a
++Libki session, provider tokens and outstanding authorization state are removed.
++The normal Libki inactivity timeout applies, and protected administration
++requests end Entra sessions at the original ID-token expiration.
++
++Entra role removal or account disable is **not continuous revocation**: an
++existing session can persist until that boundary. Locally disabling an account
++blocks its next Entra login; this export does not add a per-request database
++disable check. For immediate revocation, invalidate affected Libki sessions.
++
++Logout destroys the Libki session and shows a signed-out page. It does not sign
++out of Microsoft globally. On shared computers, end the Microsoft browser
++session separately; choosing Sign in again can reuse it.
++
++The session helper clears the cached DBIC row delegate after ID rotation because
++Session::Store::DBIC 0.14 retains the deleted row object. Compatibility with other
++session-store versions merits upstream review.
++
++## Validation and review boundaries
++
++After installing dependencies, run from the repository root:
++
++~~~sh
++prove -l t/entra_authorization.t t/entra_config.t t/entra_sync.t t/entra_controller.t t/entra_oidc.t
++~~~
++
++Tests exercise configuration failures, role mapping, account collision/disable,
++privilege downgrade, login/recovery/logout/expiry, and generic error handling.
++Controller and provisioning tests use test doubles. OIDC tests use the actual
++dependency with an ephemeral RSA key and synthetic metadata: valid and invalid
++signatures, issuer, audience, nonce, timestamps, authorized party, PKCE and
++unknown state. No network or real tenant credentials are needed.
++
++Still required before adopting this exact export: live test-tenant sign-in and
++callback with the deployed proxy, database session persistence across requests,
++account/role changes, shared-browser logout, and identity-provider outage
++recovery. These end-to-end behaviors are outside the automated tests.
++
++## Export provenance
++
++Prepared against upstream 6acf2d1327efcae92fda3509163a9a1da54b99f2.
++Only selected server authentication changes were exported. No private Git
++history, tenant configuration, production credentials, staff accounts, database
++contents, logs, or City network configuration are included. Test identities,
++email addresses and IP addresses are synthetic examples.
++
++Compared with the deployed implementation, this export preserves disabled
++accounts, removes raw provider-error diagnostics, consumes stored identities
++once, bounds staff sessions to token expiry, requires POST for local credentials,
++and adds a signed-out page. These adaptations also need maintainer acceptance.
++The screen-viewer contribution is separate.
+diff --git a/lib/Libki.pm b/lib/Libki.pm
+index 0a7b9d2..f40211d 100644
+--- a/lib/Libki.pm
++++ b/lib/Libki.pm
+@@ -3,6 +3,7 @@ package Libki;
+ use feature 'say';
+ 
+ use Moose;
++use Libki::Auth::EntraConfig;
+ use namespace::autoclean;
+ 
+ use Catalyst::Runtime 5.90132;
+@@ -40,6 +41,7 @@ use Catalyst qw(
+   Session
+   Session::Store::DBIC
+   Session::State::Cookie
++  OIDC
+ 
+   StatusMessage
+ 
+@@ -84,6 +86,13 @@ __PACKAGE__->config(
+     },
+ );
+ 
++# Staff Entra SSO is opt-in. Deployment credentials belong outside the source.
++my ($entra_config, $oidc_config) = Libki::Auth::EntraConfig->from_env(\%ENV);
++__PACKAGE__->config(
++    'Libki::Entra' => $entra_config,
++    oidc_client => $oidc_config,
++);
++
+ my $metrics_dir
+     = $ENV{LIBKI_PROM_DIR} ? $ENV{LIBKI_PROM_DIR}
+     : $ENV{INSTANCE}       ? "/dev/libki_metrics/$ENV{INSTANCE}"
+diff --git a/lib/Libki/Auth/Entra.pm b/lib/Libki/Auth/Entra.pm
+new file mode 100644
+index 0000000..d38e64e
+--- /dev/null
++++ b/lib/Libki/Auth/Entra.pm
+@@ -0,0 +1,229 @@
++package Libki::Auth::Entra;
++
++use strict;
++use warnings;
++
++use Carp qw(croak);
++
++=head1 NAME
++
++Libki::Auth::Entra - map verified single-tenant identities to Libki staff accounts
++
++=head1 METHODS
++
++=head2 authorization_from_claims
++
++Authorize claims already verified by OIDC::Client. This does not verify JWTs.
++Names and email are display attributes, never authorization criteria.
++
++=cut
++
++sub authorization_from_claims {
++    my ( $class, $claims, $config ) = @_;
++
++    return _deny('invalid_claims') unless ref($claims) eq 'HASH';
++    return _deny('invalid_config') unless ref($config) eq 'HASH';
++
++    my $expected_tenant = lc( $config->{tenant_id} // q{} );
++    my $tenant_id       = lc( $claims->{tid}       // q{} );
++    return _deny('tenant_mismatch')
++        unless _is_uuid($expected_tenant) && $tenant_id eq $expected_tenant;
++
++    my $oid = lc( $claims->{oid} // q{} );
++    return _deny('missing_object_id') unless _is_uuid($oid);
++
++    my @app_roles = _claim_values( $claims->{roles} );
++    my @groups    = map { lc($_) } _claim_values( $claims->{groups} );
++
++    my $admin_role = $config->{admin_app_role} // q{};
++    my $staff_role = $config->{staff_app_role} // q{};
++    my $admin_group = lc( $config->{admin_group_id} // q{} );
++    my $staff_group = lc( $config->{staff_group_id} // q{} );
++
++    my $is_admin_role = length($admin_role) && grep { $_ eq $admin_role } @app_roles;
++    my $is_staff_role = length($staff_role) && grep { $_ eq $staff_role } @app_roles;
++    my $is_admin_group = _is_uuid($admin_group) && grep { $_ eq $admin_group } @groups;
++    my $is_staff_group = _is_uuid($staff_group) && grep { $_ eq $staff_group } @groups;
++
++    my $uses_group_fallback = _is_uuid($admin_group) || _is_uuid($staff_group);
++    my $has_group_overage
++        = ref( $claims->{_claim_names} ) eq 'HASH'
++        && exists $claims->{_claim_names}->{groups};
++    $has_group_overage ||= $claims->{hasgroups};
++
++    return _deny('group_overage')
++        if !$is_admin_role && !$is_staff_role
++        && $uses_group_fallback && $has_group_overage;
++
++    my $is_admin = $is_admin_role || $is_admin_group;
++    my $is_staff = $is_staff_role || $is_staff_group;
++    return _deny('not_assigned') unless $is_admin || $is_staff;
++
++    my $firstname = _clean_text( $claims->{given_name}, 191 );
++    my $lastname  = _clean_text( $claims->{family_name}, 191 );
++    my $display_name = _clean_text( $claims->{name}, 191 );
++    $display_name ||= join q{ }, grep { length } ( $firstname, $lastname );
++    $display_name ||= _clean_text( $claims->{preferred_username}, 191 );
++    $display_name ||= 'Entra staff';
++
++    my $email = _clean_text( $claims->{email}, 191 );
++    if ( !length($email) ) {
++        my $preferred = _clean_text( $claims->{preferred_username}, 191 );
++        $email = $preferred if $preferred =~ /\A[^\s\@]+\@[^\s\@]+\z/;
++    }
++
++    return {
++        authorized           => 1,
++        tenant_id            => $tenant_id,
++        oid                  => $oid,
++        username             => "entra-$oid",
++        firstname            => $firstname,
++        lastname             => $lastname,
++        display_name         => $display_name,
++        email                => $email,
++        role_level           => $is_admin ? 'admin' : 'staff',
++        libki_roles          => $is_admin ? [qw/admin superadmin/] : [qw/admin/],
++        authorization_source => ( $is_admin_role || $is_staff_role )
++            ? 'app_role'
++            : 'group',
++    };
++}
++
++=head2 sync_user
++
++Create or reconcile an Entra-owned staff account in the current instance.
++Keep disabled accounts disabled and refuse to overwrite a local account.
++
++=cut
++
++sub sync_user {
++    my ( $class, $c, $decision ) = @_;
++
++    croak 'Entra decision is not authorized'
++        unless ref($decision) eq 'HASH' && $decision->{authorized};
++
++    my $instance = $c->instance;
++    my $username = $decision->{username};
++    my $user;
++
++    $c->model('DB')->txn_do(
++        sub {
++            $user = $c->model('DB::User')->find(
++                {
++                    instance => $instance,
++                    username => $username,
++                }
++            );
++
++            if ($user) {
++                my $source = $user->creation_source // q{};
++                croak "Refusing to replace non-Entra account '$username'"
++                    if $source ne 'entra';
++
++                croak 'Entra account is locally disabled'
++                    unless ( $user->status // q{} ) eq 'enabled';
++
++                $user->update(
++                    {
++                        firstname      => $decision->{firstname},
++                        lastname       => $decision->{lastname},
++                        updated_on     => $c->now,
++                        creation_source => 'entra',
++                    }
++                );
++            }
++            else {
++                require Crypt::PRNG;
++                my $unusable_password = Crypt::PRNG::random_bytes_b64u(48);
++                $user = $c->model('DB::User')->create(
++                    {
++                        instance        => $instance,
++                        username        => $username,
++                        password        => $unusable_password,
++                        firstname       => $decision->{firstname},
++                        lastname        => $decision->{lastname},
++                        status          => 'enabled',
++                        created_on      => $c->now,
++                        updated_on      => $c->now,
++                        creation_source => 'entra',
++                    }
++                );
++            }
++
++            my %wanted = map { $_ => 1 } @{ $decision->{libki_roles} };
++            for my $role_name (qw/admin superadmin/) {
++                my $role = $c->model('DB::Role')->find( { role => $role_name } )
++                    or croak "Required Libki role '$role_name' does not exist";
++
++                if ( $wanted{$role_name} ) {
++                    $c->model('DB::UserRole')->find_or_create(
++                        {
++                            user_id => $user->id,
++                            role_id => $role->id,
++                        }
++                    );
++                }
++                else {
++                    $c->model('DB::UserRole')->search(
++                        {
++                            user_id => $user->id,
++                            role_id => $role->id,
++                        }
++                    )->delete;
++                }
++            }
++        }
++    );
++
++    return $c->model('DB::User')->find(
++        {
++            instance => $instance,
++            username => $username,
++        }
++    );
++}
++
++=head2 is_shadow_username
++
++Identify the reserved Entra username namespace used to block password login.
++
++=cut
++
++sub is_shadow_username {
++    my ( $class, $username ) = @_;
++    return defined($username)
++        && $username =~ /\Aentra-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i;
++}
++
++sub _claim_values {
++    my ($value) = @_;
++    return () unless defined $value;
++    return grep { defined($_) && !ref($_) && length($_) } @{$value}
++        if ref($value) eq 'ARRAY';
++    return ref($value) ? () : ($value);
++}
++
++sub _clean_text {
++    my ( $value, $maximum_length ) = @_;
++    return q{} if !defined($value) || ref($value);
++    $value =~ s/[\x00-\x1f\x7f]+/ /g;
++    $value =~ s/\A\s+|\s+\z//g;
++    $value =~ s/\s+/ /g;
++    return substr( $value, 0, $maximum_length );
++}
++
++sub _is_uuid {
++    my ($value) = @_;
++    return defined($value)
++        && $value =~ /\A[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\z/i;
++}
++
++sub _deny {
++    my ($reason) = @_;
++    return {
++        authorized => 0,
++        reason     => $reason,
++    };
++}
++
++1;
+\ No newline at end of file
+diff --git a/lib/Libki/Auth/EntraConfig.pm b/lib/Libki/Auth/EntraConfig.pm
+new file mode 100644
+index 0000000..b61e0c1
+--- /dev/null
++++ b/lib/Libki/Auth/EntraConfig.pm
+@@ -0,0 +1,87 @@
++package Libki::Auth::EntraConfig;
++use strict;
++use warnings;
++use Carp qw(croak);
++
++=head1 NAME
++
++Libki::Auth::EntraConfig - optional single-tenant staff authentication settings
++
++=head1 METHODS
++
++=head2 from_env
++
++Build Libki authorization and OIDC client settings from an environment hash.
++Disabled installations require no tenant registration or credentials.
++
++=cut
++
++sub from_env {
++    my ( $class, $env ) = @_;
++    my $entra_enabled = ( $env->{LIBKI_ENTRA_ENABLED} // q{} ) =~ /\A(?:1|true|yes|on)\z/i
++        ? 1
++        : 0;
++
++    my $entra_config = {
++        enabled        => 0,
++        admin_app_role => $env->{LIBKI_ENTRA_ADMIN_APP_ROLE} // 'Libki.Admin',
++        staff_app_role => $env->{LIBKI_ENTRA_STAFF_APP_ROLE} // 'Libki.Staff',
++    };
++    my $oidc_client_config = {
++        authentication_error_path => '/administration/login/entra/error',
++        provider                  => {},
++    };
++
++    if ($entra_enabled) {
++        for my $required (qw/LIBKI_ENTRA_TENANT_ID LIBKI_ENTRA_CLIENT_ID OIDC_ENTRA_SECRET/) {
++            croak "$required is required when LIBKI_ENTRA_ENABLED is true"
++                unless defined( $env->{$required} ) && $env->{$required} =~ /\S/;
++        }
++
++        my $tenant_id = lc $env->{LIBKI_ENTRA_TENANT_ID};
++        my $client_id = lc $env->{LIBKI_ENTRA_CLIENT_ID};
++        my $guid_pattern = qr/\A[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\z/;
++        croak 'LIBKI_ENTRA_TENANT_ID must be a GUID' unless $tenant_id =~ $guid_pattern;
++        croak 'LIBKI_ENTRA_CLIENT_ID must be a GUID' unless $client_id =~ $guid_pattern;
++
++        for my $key (qw/LIBKI_ENTRA_ADMIN_GROUP_ID LIBKI_ENTRA_STAFF_GROUP_ID/) {
++            croak "$key must be a GUID"
++                if length( $env->{$key} // q{} ) && lc($env->{$key}) !~ $guid_pattern;
++        }
++
++        $entra_config = {
++            %{$entra_config},
++            enabled        => 1,
++            tenant_id      => $tenant_id,
++            client_id      => $client_id,
++            admin_group_id => lc( $env->{LIBKI_ENTRA_ADMIN_GROUP_ID} // q{} ),
++            staff_group_id => lc( $env->{LIBKI_ENTRA_STAFF_GROUP_ID} // q{} ),
++        };
++        $oidc_client_config->{default_provider} = 'ENTRA';
++        $oidc_client_config->{provider}->{ENTRA} = {
++            id                         => $client_id,
++            secret                     => $env->{OIDC_ENTRA_SECRET},
++            well_known_url             => "https://login.microsoftonline.com/$tenant_id/v2.0/.well-known/openid-configuration",
++            signin_redirect_path       => '/oidc/entra/callback',
++            scope                      => 'openid profile email',
++            store_mode                 => 'session',
++            use_pkce                   => 1,
++            pkce_code_challenge_method => 'S256',
++            expiration_leeway          => 60,
++            max_id_token_age           => 600,
++            client_auth_method         => 'client_secret_post',
++        };
++    }
++
++    return ($entra_config, $oidc_client_config);
++}
++
++
++=head1 LICENSE
++
++This file is part of Libki and is licensed under the GNU Affero General Public
++License version 3 or, at your option, any later version.
++
++=cut
++
++1;
+diff --git a/lib/Libki/Auth/Session.pm b/lib/Libki/Auth/Session.pm
+new file mode 100644
+index 0000000..d979304
+--- /dev/null
++++ b/lib/Libki/Auth/Session.pm
+@@ -0,0 +1,43 @@
++package Libki::Auth::Session;
++
++use strict;
++use warnings;
++
++=head1 NAME
++
++Libki::Auth::Session - authentication-boundary session helpers
++
++=head1 METHODS
++
++=head2 rotate_id
++
++Rotate the Catalyst session ID and discard the stale cached DBIC delegate.
++Catalyst::Plugin::Session::Store::DBIC 0.14 retains the row object that the
++upstream C<change_session_id> method deletes. If that delegate reaches request
++finalization, DBIx::Class attempts to update the deleted row and the request
++fails. Dropping only the cached delegate allows the normal request finalizer to
++persist the current session under the newly generated ID.
++
++=cut
++
++sub rotate_id {
++    my ( $class, $c ) = @_;
++
++    return unless $c && $c->can('change_session_id');
++
++    my $new_id = $c->change_session_id;
++    $c->_session_store_delegate(undef)
++        if $c->can('_session_store_delegate');
++
++    return $new_id;
++}
++
++
++=head1 LICENSE
++
++This file is part of Libki and is licensed under the GNU Affero General Public
++License version 3 or, at your option, any later version.
++
++=cut
++
++1;
+diff --git a/lib/Libki/Controller/Administration.pm b/lib/Libki/Controller/Administration.pm
+index 9a43e1a..0b17e7d 100644
+--- a/lib/Libki/Controller/Administration.pm
++++ b/lib/Libki/Controller/Administration.pm
+@@ -81,6 +81,16 @@ sub auto : Private {
+         return 1;
+     }
+ 
++    if ( ($c->session->{staff_auth_source} // q{}) eq 'Microsoft Entra ID'
++        && ( !$c->config->{'Libki::Entra'}->{enabled}
++             || ($c->session->{staff_entra_expires_at} // 0) <= time ) ) {
++        $c->logout;
++        $c->delete_session('Entra staff session expired');
++        $c->_session_store_delegate(undef) if $c->can('_session_store_delegate');
++        $c->response->redirect( $c->uri_for('/administration/login') );
++        return 0;
++    }
++
+     if ( $c->user_exists ) {
+         if ( $c->user->instance ne $c->instance ) {
+             $c->response->body('Unauthorized!!');
+diff --git a/lib/Libki/Controller/Administration/Login.pm b/lib/Libki/Controller/Administration/Login.pm
+index 657584f..ca1e8e6 100644
+--- a/lib/Libki/Controller/Administration/Login.pm
++++ b/lib/Libki/Controller/Administration/Login.pm
+@@ -2,50 +2,87 @@ package Libki::Controller::Administration::Login;
+ use Moose;
+ use namespace::autoclean;
+ 
++use JSON qw(to_json);
++use Libki::Auth::Entra;
++use Libki::Auth::Session;
++
+ BEGIN { extends 'Catalyst::Controller'; }
+ 
+ =head1 NAME
+ 
+-LibkiServer::Controller::Admin::Login - Catalyst Controller
++LibkiServer::Controller::Admin::Login - Catalyst administration login controller
+ 
+-=head1 DESCRIPTION
++=head1 METHODS
+ 
+-Catalyst Controller.
++=head2 index
+ 
+-=head1 METHODS
++Automatically start Microsoft Entra sign-in when it is enabled. If Entra is
++disabled, retain the upstream-compatible local login as a recovery path.
+ 
+ =cut
+ 
+-=head2 index
++sub index : Path : Args(0) {
++    my ( $self, $c ) = @_;
++
++    $self->_set_no_store($c);
++    my $entra_config = $self->_entra_config($c);
++    if ( $entra_config->{enabled} ) {
++        $c->response->redirect( $c->uri_for('/administration/login/entra') );
++        $c->response->status(303) if uc( $c->request->method // 'GET' ) eq 'POST';
++        return;
++    }
++
++    return $self->_local_login( $c, $entra_config, 0 );
++}
++
++=head2 emergency
+ 
+-Login logic
++Render and process the explicit local break-glass route. This route is linked
++only from the Entra error screen and is never the normal staff landing page.
+ 
+ =cut
+ 
+-sub index : Path : Args(0) {
++sub emergency : Path('emergency') : Args(0) {
+     my ( $self, $c ) = @_;
+ 
+-    # Get the username and password from form
++    $self->_set_no_store($c);
++    my $entra_config = $self->_entra_config($c);
++    return $self->_local_login( $c, $entra_config, 1 );
++}
++
++sub _local_login {
++    my ( $self, $c, $entra_config, $breakglass_mode ) = @_;
++
++    $c->stash(
++        entra_sso_enabled => $entra_config->{enabled} ? 1 : 0,
++        breakglass_mode   => $breakglass_mode ? 1 : 0,
++    );
++
+     my $username  = $c->request->params->{username};
+     my $password  = $c->request->params->{password};
+     my $submitted = $c->request->params->{submitted} || 0;
+ 
+-    my $instance = $c->instance;
+-
+-    # If the username and password values were found in form
+-    if ( $username && $password ) {
+-
+-        # Attempt to log the user in
+-        if (
+-            $c->authenticate(
++    if ( uc( $c->request->method // 'GET' ) eq 'POST' && $username && $password ) {
++        my $authenticated = 0;
++        if ( !Libki::Auth::Entra->is_shadow_username($username) ) {
++            $authenticated = $c->authenticate(
+                 {
+                     username => $username,
+                     password => $password,
+-                    instance => $instance,
++                    instance => $c->instance,
+                 }
+-            )
+-          )
+-        {
++            );
++        }
++
++        if ($authenticated) {
++            if ( $entra_config->{enabled} ) {
++                $c->oidc('ENTRA')->delete_stored_data();
++                delete $c->session->{oidc_auth};
++            }
++            Libki::Auth::Session->rotate_id($c);
++            delete @{$c->session}{qw/staff_display_name staff_email staff_entra_oid staff_role_level staff_entra_expires_at/};
++            $c->session->{staff_auth_source} = 'Local account';
++
+             $c->model('DB::Statistic')->create(
+                 {
+                     action     => 'ADMIN_LOGIN',
+@@ -53,10 +90,14 @@ sub index : Path : Args(0) {
+                     instance   => $c->instance,
+                     session_id => $c->sessionid,
+                     username   => $username,
++                    info       => to_json( { auth_source => 'local' } ),
+                 }
+             );
+ 
+-            # If successful, then let them use the application
++            my $remote = $c->request->address // 'unknown';
++            my $message = "Local administration login used by '$username' from $remote";
++            $entra_config->{enabled} ? $c->log->warn($message) : $c->log->info($message);
++
+             $c->response->redirect(
+                 $c->uri_for(
+                     $c->controller('Administration')->action_for('index')
+@@ -64,22 +105,231 @@ sub index : Path : Args(0) {
+             );
+             return;
+         }
+-        else {
+ 
+-            # Set an error message
+-            $c->stash( error => "BAD_LOGIN" );
+-        }
++        $c->stash(
++            error         => 'BAD_LOGIN',
++            error_message => 'The username or password was not accepted.',
++        );
+     }
+-    else {
+-        if ($submitted) {
+-
+-            # Set an error message
+-            $c->stash( error => "EMPTY_LOGIN" );
+-        }
++    elsif ($submitted) {
++        $c->stash(
++            error         => 'EMPTY_LOGIN',
++            error_message => 'Enter both a username and password.',
++        );
+     }
+ 
+-    # If either of above don't work out, send to the login page
+     $c->stash( template => 'administration/login.tt' );
++    return;
++}
++
++=head2 entra
++
++Start the Microsoft Entra authorization-code flow. The target URL is fixed to
++an internal action so request parameters cannot create an open redirect.
++
++=cut
++
++sub entra : Path('entra') : Args(0) {
++    my ( $self, $c ) = @_;
++
++    $self->_set_no_store($c);
++    my $config = $self->_entra_config($c);
++    return $self->_render_login_error(
++        $c,
++        'Microsoft staff sign-in is not configured on this server.',
++        404,
++    ) unless $config->{enabled};
++
++    $c->oidc('ENTRA')->delete_stored_data();
++    $c->oidc('ENTRA')->redirect_to_authorize(
++        target_url => $c->uri_for('/administration/login/entra/complete')->as_string,
++    );
++    return;
++}
++
++=head2 entra_complete
++
++Convert a verified Entra identity into an Entra-managed Libki shadow account,
++then establish the normal Libki authorization session.
++
++=cut
++
++sub entra_complete : Path('entra/complete') : Args(0) {
++    my ( $self, $c ) = @_;
++
++    $self->_set_no_store($c);
++    my $config = $self->_entra_config($c);
++    return $self->_render_login_error(
++        $c,
++        'Microsoft staff sign-in is not configured on this server.',
++        404,
++    ) unless $config->{enabled};
++
++    my $identity = eval { $c->oidc('ENTRA')->get_valid_identity() };
++    if ( !$identity ) {
++        $c->log->warn('Entra completion reached without a valid stored identity');
++        return $self->_render_login_error(
++            $c,
++            'Microsoft sign-in could not be completed. Please try again.',
++            401,
++        );
++    }
++
++    my $claims = $identity->claims;
++    $c->oidc('ENTRA')->delete_stored_data();
++    delete $c->session->{oidc_auth};
++    unless ( ($claims->{exp} // 0) =~ /\A[0-9]+\z/ && $claims->{exp} > time ) {
++        return $self->_render_login_error($c, 'Microsoft sign-in has expired. Please try again.', 401);
++    }
++    my $decision = Libki::Auth::Entra->authorization_from_claims(
++        $identity->claims,
++        $config,
++    );
++
++    if ( !$decision->{authorized} ) {
++        eval { $c->oidc('ENTRA')->delete_stored_data() };
++        my $reason = $decision->{reason} // 'unknown';
++        $c->log->warn("Entra staff authorization denied: $reason");
++        return $self->_render_login_error(
++            $c,
++            'Your Microsoft account is not assigned to Libki staff access.',
++            403,
++        );
++    }
++
++    my $user = eval { Libki::Auth::Entra->sync_user( $c, $decision ) };
++    if ( !$user ) {
++        $c->log->error('Entra shadow-account synchronization failed');
++        eval { $c->oidc('ENTRA')->delete_stored_data() };
++        return $self->_render_login_error(
++            $c,
++            'Your Microsoft account was verified, but Libki could not prepare the staff session.',
++            500,
++        );
++    }
++
++    my $auth_user = eval {
++        $c->find_user(
++            {
++                instance => $c->instance,
++                username => $decision->{username},
++            }
++        );
++    };
++    if ( !$auth_user ) {
++        $c->log->error('Entra authentication-wrapper preparation failed');
++        eval { $c->oidc('ENTRA')->delete_stored_data() };
++        return $self->_render_login_error(
++            $c,
++            'Your Microsoft account was verified, but Libki could not prepare the staff session.',
++            500,
++        );
++    }
++
++    Libki::Auth::Session->rotate_id($c);
++    my $session_established = eval {
++        $c->set_authenticated($auth_user);
++        1;
++    };
++    if ( !$session_established ) {
++        $c->log->error('Entra authenticated-session establishment failed');
++        eval { $c->logout };
++        eval { $c->oidc('ENTRA')->delete_stored_data() };
++        return $self->_render_login_error(
++            $c,
++            'Your Microsoft account was verified, but Libki could not prepare the staff session.',
++            500,
++        );
++    }
++
++    $c->session->{staff_display_name} = $decision->{display_name};
++    $c->session->{staff_email}        = $decision->{email};
++    $c->session->{staff_auth_source}  = 'Microsoft Entra ID';
++    $c->session->{staff_entra_oid}    = $decision->{oid};
++    $c->session->{staff_role_level}   = $decision->{role_level};
++    $c->session->{staff_entra_expires_at} = $claims->{exp};
++
++    $c->model('DB::Statistic')->create(
++        {
++            action     => 'ADMIN_LOGIN',
++            created_on => $c->now,
++            instance   => $c->instance,
++            session_id => $c->sessionid,
++            username   => $decision->{username},
++            info       => to_json(
++                {
++                    auth_source         => 'entra',
++                    role_level          => $decision->{role_level},
++                    authorization_source => $decision->{authorization_source},
++                    oid                 => $decision->{oid},
++                }
++            ),
++        }
++    );
++
++    $c->log->info("Entra administration login established for $decision->{username}");
++    $c->response->redirect( $c->uri_for('/administration') );
++    return;
++}
++
++=head2 entra_error
++
++Render a generic error after the OIDC plugin rejects a provider response. Raw
++provider errors are intentionally not displayed in the browser.
++
++=cut
++
++sub entra_error : Path('entra/error') : Args(0) {
++    my ( $self, $c ) = @_;
++
++    $self->_set_no_store($c);
++    delete $c->flash->{error_message} if $c->can('flash');
++    $c->log->warn('Microsoft Entra authentication callback failed validation');
++    return $self->_render_login_error(
++        $c,
++        'Microsoft sign-in could not be completed. Please try again or contact Information Technology.',
++        401,
++    );
++}
++
++=head2 signed_out
++
++Show a landing page without automatically restarting Microsoft sign-in.
++
++=cut
++
++sub signed_out : Path('signed-out') : Args(0) {
++    my ( $self, $c ) = @_;
++    $self->_set_no_store($c);
++    $c->stash(
++        entra_sso_enabled => $self->_entra_config($c)->{enabled} ? 1 : 0,
++        template => 'administration/signed_out.tt',
++    );
++}
++
++sub _entra_config {
++    my ( $self, $c ) = @_;
++    return $c->config->{'Libki::Entra'} || { enabled => 0 };
++}
++
++sub _render_login_error {
++    my ( $self, $c, $message, $status ) = @_;
++    $c->response->status($status) if $status;
++    $c->stash(
++        entra_sso_enabled => $self->_entra_config($c)->{enabled} ? 1 : 0,
++        entra_error_mode  => 1,
++        error_message     => $message,
++        template          => 'administration/login.tt',
++    );
++    return;
++}
++
++sub _set_no_store {
++    my ( $self, $c ) = @_;
++    $c->response->headers->header( 'Cache-Control' => 'no-store' );
++    $c->response->headers->header( 'Pragma'        => 'no-cache' );
++    $c->response->headers->header( 'Referrer-Policy' => 'no-referrer' );
++    return;
+ }
+ 
+ =head1 AUTHOR
+@@ -97,14 +347,6 @@ it under the terms of the GNU Affero General Public License as
+ published by the Free Software Foundation, either version 3 of
+ the License, or (at your option) any later version.
+ 
+-Libki is distributed in the hope that it will be useful,
+-but WITHOUT ANY WARRANTY; without even the implied warranty of
+-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-GNU General Public License for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Libki.  If not, see <http://www.gnu.org/licenses/>.
+-
+ =cut
+ 
+ __PACKAGE__->meta->make_immutable;
+diff --git a/lib/Libki/Controller/Administration/Logout.pm b/lib/Libki/Controller/Administration/Logout.pm
+index 67904b1..c841dd7 100644
+--- a/lib/Libki/Controller/Administration/Logout.pm
++++ b/lib/Libki/Controller/Administration/Logout.pm
+@@ -2,36 +2,35 @@ package Libki::Controller::Administration::Logout;
+ use Moose;
+ use namespace::autoclean;
+ 
+-BEGIN {extends 'Catalyst::Controller'; }
+ 
+-=head1 NAME
+-
+-Libki::Controller::Administration::Logout - Catalyst Controller
++BEGIN { extends 'Catalyst::Controller'; }
+ 
+-=head1 DESCRIPTION
++=head1 NAME
+ 
+-Catalyst Controller.
++Libki::Controller::Administration::Logout - staff logout controller
+ 
+ =head1 METHODS
+ 
+-=cut
+-
+-
+ =head2 index
+ 
++Clear both the Libki authentication state and any OIDC token material retained
++in the server-side session.
++
+ =cut
+ 
+-sub index :Path :Args(0) {
++sub index : Path : Args(0) {
+     my ( $self, $c ) = @_;
+ 
+-    # Clear the user's state
++    my $entra_enabled = ($c->config->{'Libki::Entra'} || {})->{enabled};
+     $c->logout;
+-
+-    # Send the user to the starting point
+-    $c->response->redirect( $c->uri_for('/administration/login') );
++    $c->delete_session('Staff logout');
++    $c->_session_store_delegate(undef) if $c->can('_session_store_delegate');
++    $c->response->headers->header( 'Cache-Control' => 'no-store' );
++    $c->response->redirect( $c->uri_for(
++        $entra_enabled ? '/administration/login/signed-out' : '/administration/login'
++    ) );
+ }
+ 
+-
+ =head1 AUTHOR
+ 
+ Kyle M Hall <kyle@kylehall.info>
+@@ -47,14 +46,6 @@ it under the terms of the GNU Affero General Public License as
+ published by the Free Software Foundation, either version 3 of
+ the License, or (at your option) any later version.
+ 
+-Libki is distributed in the hope that it will be useful,
+-but WITHOUT ANY WARRANTY; without even the implied warranty of
+-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-GNU General Public License for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Libki.  If not, see <http://www.gnu.org/licenses/>.
+-
+ =cut
+ 
+ __PACKAGE__->meta->make_immutable;
+diff --git a/root/dynamic/templates/administration/login.tt b/root/dynamic/templates/administration/login.tt
+index b1b3a9d..78b2447 100644
+--- a/root/dynamic/templates/administration/login.tt
++++ b/root/dynamic/templates/administration/login.tt
+@@ -1,7 +1,14 @@
+ [% meta.title = c.loc("Log in") %]
+ 
+ <div class="container">
+-<form class="form-horizontal" role="form" method="POST" action="[% c.uri_for('/administration/login') %]">
++[% IF error_message %]<div class="alert alert-danger" role="alert">[% error_message | html %]</div>[% END %]
++[% IF entra_sso_enabled %]
++    <p><a class="btn btn-primary" href="[% c.uri_for('/administration/login/entra') %]">[% c.loc("Sign in with Microsoft") %]</a></p>
++    [% IF !breakglass_mode %]<p><a href="[% c.uri_for('/administration/login/emergency') %]">[% c.loc("Local recovery access") %]</a></p>[% END %]
++[% END %]
++[% IF breakglass_mode || !entra_sso_enabled %]
++[% IF breakglass_mode %]<p>[% c.loc("Local recovery access. Use your existing local staff account.") %]</p>[% END %]
++<form class="form-horizontal" role="form" method="POST" action="[% IF breakglass_mode %][% c.uri_for('/administration/login/emergency') %][% ELSE %][% c.uri_for('/administration/login') %][% END %]" >
+     <div class="row">
+         <div class="col-md-3"></div>
+         <div class="col-md-6">
+@@ -65,4 +72,5 @@
+         </div>
+     </div>
+ </form>
++[% END %]
+ </div>
+diff --git a/root/dynamic/templates/administration/signed_out.tt b/root/dynamic/templates/administration/signed_out.tt
+new file mode 100644
+index 0000000..6a62b9b
+--- /dev/null
++++ b/root/dynamic/templates/administration/signed_out.tt
+@@ -0,0 +1,8 @@
++[% meta.title = c.loc("Signed out") %]
++<div class="container">
++    <h2>[% c.loc("You have signed out of Libki.") %]</h2>
++    [% IF entra_sso_enabled %]
++    <p>[% c.loc("Your Microsoft browser session may still be active. On a shared computer, sign out of Microsoft and close the browser when finished.") %]</p>
++    [% END %]
++    <a class="btn btn-primary" href="[% c.uri_for('/administration/login') %]">[% c.loc("Sign in again") %]</a>
++</div>
+diff --git a/t/entra_authorization.t b/t/entra_authorization.t
+new file mode 100644
+index 0000000..661754e
+--- /dev/null
++++ b/t/entra_authorization.t
+@@ -0,0 +1,112 @@
++use strict;
++use warnings;
++
++use FindBin qw($Bin);
++use lib "$Bin/../lib";
++use Test::More;
++
++use Libki::Auth::Entra;
++
++my $tenant = '11111111-2222-4333-8444-555555555555';
++my $oid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
++my $other_tenant = '99999999-8888-4777-8666-555555555555';
++
++my $config = {
++    tenant_id     => $tenant,
++    admin_app_role => 'Libki.Admin',
++    staff_app_role => 'Libki.Staff',
++};
++
++sub decision {
++    my (%claims) = @_;
++    return Libki::Auth::Entra->authorization_from_claims(
++        {
++            tid => $tenant,
++            oid => $oid,
++            %claims,
++        },
++        $config,
++    );
++}
++
++is(
++    decision( tid => $other_tenant, roles => ['Libki.Admin'] )->{reason},
++    'tenant_mismatch',
++    'a token from another tenant is denied',
++);
++
++is(
++    Libki::Auth::Entra->authorization_from_claims(
++        { tid => $tenant, roles => ['Libki.Admin'] },
++        $config,
++    )->{reason},
++    'missing_object_id',
++    'an identity without an Entra object ID is denied',
++);
++
++is(
++    decision( roles => ['Some.Other.Role'] )->{reason},
++    'not_assigned',
++    'an authenticated but unassigned identity is denied',
++);
++
++my $staff = decision(
++    roles              => ['Libki.Staff'],
++    name               => "  Library\x00 Staff  ",
++    preferred_username => 'library.staff@example.gov',
++);
++ok($staff->{authorized}, 'the staff app role is authorized');
++is($staff->{role_level}, 'staff', 'the staff app role receives staff scope');
++is_deeply($staff->{libki_roles}, ['admin'], 'staff receives the normal Libki administration role');
++is($staff->{authorization_source}, 'app_role', 'staff authorization records the app-role source');
++is($staff->{display_name}, 'Library Staff', 'display names are normalized before entering the session');
++is($staff->{email}, 'library.staff@example.gov', 'preferred username supplies email when the email claim is absent');
++
++my $admin = decision(
++    roles  => ['Libki.Admin'],
++    name   => 'Information Technology',
++    email  => 'it@example.gov',
++);
++ok($admin->{authorized}, 'the administrator app role is authorized');
++is($admin->{role_level}, 'admin', 'the administrator app role receives administrator scope');
++is_deeply($admin->{libki_roles}, [qw/admin superadmin/], 'administrator receives both Libki roles');
++
++is($staff->{username}, "entra-$oid", 'the shadow username is stable and based on the immutable object ID');
++is(
++    decision( roles => ['Libki.Staff'], preferred_username => 'renamed@example.gov' )->{username},
++    $staff->{username},
++    'changing an email address does not change the shadow username',
++);
++
++my $admin_group = '12345678-9abc-67de-8f01-23456789abcd';
++my $group_decision = Libki::Auth::Entra->authorization_from_claims(
++    {
++        tid    => $tenant,
++        oid    => $oid,
++        groups => [$admin_group],
++    },
++    {
++        %{$config},
++        admin_group_id => $admin_group,
++    },
++);
++ok($group_decision->{authorized}, 'configured group fallback accepts an arbitrary valid Entra GUID');
++is($group_decision->{authorization_source}, 'group', 'group fallback is identified in the audit decision');
++
++my $overage = Libki::Auth::Entra->authorization_from_claims(
++    {
++        tid          => $tenant,
++        oid          => $oid,
++        _claim_names => { groups => 'src1' },
++    },
++    {
++        %{$config},
++        staff_group_id => 'abcd1234-5678-4abc-8def-1234567890ab',
++    },
++);
++is($overage->{reason}, 'group_overage', 'group overage is denied instead of silently broadening access');
++
++ok(Libki::Auth::Entra->is_shadow_username("entra-$oid"), 'valid Entra shadow username is recognized');
++ok(!Libki::Auth::Entra->is_shadow_username('libkiadmin'), 'local account is not mistaken for an Entra shadow account');
++
++done_testing;
+diff --git a/t/entra_config.t b/t/entra_config.t
+new file mode 100644
+index 0000000..4f521b8
+--- /dev/null
++++ b/t/entra_config.t
+@@ -0,0 +1,33 @@
++use strict;
++use warnings;
++use Test::More;
++use lib 'lib';
++use Libki::Auth::EntraConfig;
++my ($disabled, $empty) = Libki::Auth::EntraConfig->from_env({});
++ok(!$disabled->{enabled}, 'SSO defaults off');
++is_deeply($empty->{provider}, {}, 'disabled setup makes no provider');
++my %env = (
++    LIBKI_ENTRA_ENABLED => 1,
++    LIBKI_ENTRA_TENANT_ID => '11111111-2222-4333-8444-555555555555',
++    LIBKI_ENTRA_CLIENT_ID => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
++    OIDC_ENTRA_SECRET => join('', 'test', '-only'),
++);
++for my $required (qw/LIBKI_ENTRA_TENANT_ID LIBKI_ENTRA_CLIENT_ID OIDC_ENTRA_SECRET/) {
++    my %bad = %env; delete $bad{$required};
++    eval { Libki::Auth::EntraConfig->from_env(\%bad) };
++    like($@, qr/\Q$required\E is required/, "missing $required fails closed");
++}
++for my $id (qw/LIBKI_ENTRA_TENANT_ID LIBKI_ENTRA_CLIENT_ID LIBKI_ENTRA_ADMIN_GROUP_ID LIBKI_ENTRA_STAFF_GROUP_ID/) {
++    eval { Libki::Auth::EntraConfig->from_env({%env, $id => 'invalid'}) };
++    like($@, qr/\Q$id\E must be a GUID/, "invalid $id fails closed");
++}
++my ($config, $oidc) = Libki::Auth::EntraConfig->from_env(\%env);
++my $p = $oidc->{provider}{ENTRA};
++ok($config->{enabled}, 'explicit configuration enables SSO');
++is($p->{scope}, 'openid profile email', 'no Graph or offline access requested');
++is($p->{store_mode}, 'session', 'tokens stay in server-side session');
++ok($p->{use_pkce}, 'PKCE enabled');
++is($p->{pkce_code_challenge_method}, 'S256', 'PKCE S256');
++like($p->{well_known_url}, qr{/\Q$env{LIBKI_ENTRA_TENANT_ID}\E/v2\.0/}, 'issuer discovery is tenant-specific');
++is($p->{max_id_token_age}, 600, 'token issue-age is bounded');
++done_testing;
+diff --git a/t/entra_controller.t b/t/entra_controller.t
+new file mode 100644
+index 0000000..66bfc84
+--- /dev/null
++++ b/t/entra_controller.t
+@@ -0,0 +1,115 @@
++use strict;
++use warnings;
++use Test::More;
++use HTTP::Headers;
++use URI;
++use lib 'lib';
++use Libki::Controller::Administration::Login;
++use Libki::Controller::Administration::Logout;
++use Libki::Controller::Administration;
++{
++    package TestContext;
++    sub new {
++        bless {config=>{'Libki::Entra'=>{enabled=>1,tenant_id=>'11111111-2222-4333-8444-555555555555',staff_app_role=>'Libki.Staff',admin_app_role=>'Libki.Admin'}},
++            stash=>{},session=>{},flash=>{},headers=>HTTP::Headers->new,
++            method=>'GET',params=>{},logs=>[],events=>[]}, shift;
++    }
++    sub config { $_[0]{config} }
++    sub stash { my $s=shift; @{$s->{stash}}{@_[grep {$_%2==0} 0..$#_]}=@_[grep {$_%2==1} 0..$#_] if @_; $s->{stash} }
++    sub session { $_[0]{session} }
++    sub flash { $_[0]{flash} }
++    sub response { $_[0] } sub request { $_[0] } sub log { $_[0] }
++    sub headers { $_[0]{headers} }
++    sub method { $_[0]{method} } sub params { $_[0]{params} }
++    sub address { '192.0.2.1' }
++    sub status { $_[0]{status}=$_[1] if @_>1; $_[0]{status} }
++    sub redirect { $_[0]{redirect}="$_[1]" }
++    sub uri_for { URI->new('https://staff.example.org'.$_[1]) }
++    sub controller { $_[0] } sub action_for { '/administration' }
++    sub warn { push @{$_[0]{logs}},$_[1] } sub info { shift->warn(@_) } sub error { shift->warn(@_) }
++    sub oidc { bless {c=>$_[0]}, 'TestOIDC' }
++    sub authenticate { $_[0]{authenticate_calls}++; $_[0]{password_ok} }
++    sub find_user { $_[0]{wrapper} }
++    sub set_authenticated { die 'test failure' if $_[0]{fail_auth}; $_[0]{authenticated}=$_[1];push @{$_[0]{events}},'auth' }
++    sub change_session_id { push @{$_[0]{events}},'rotate'; 'new-id' }
++    sub _session_store_delegate { $_[0]{delegate}=$_[1] }
++    sub sessionid { 'new-id' } sub instance { 'test-instance' }
++    sub now { '2026-01-01 00:00:00' }
++    sub model { bless {c=>$_[0]}, 'TestAudit' }
++    sub logout { delete $_[0]{authenticated}; $_[0]{logged_out}=1 }
++    sub delete_session { $_[0]{session}={}; $_[0]{deleted_session}=1 }
++    sub user_exists { !!$_[0]{authenticated} }
++    package TestOIDC;
++    sub delete_stored_data { delete $_[0]{c}{identity}; $_[0]{c}{cleared}=1 }
++    sub redirect_to_authorize { my ($s,%args)=@_; $s->{c}{authorize}=\%args }
++    sub get_valid_identity { $_[0]{c}{identity} }
++    package TestIdentity;
++    sub claims { $_[0]{claims} }
++    package TestAudit;
++    sub create { $_[0]{c}{audit}=$_[1] }
++}
++my $login = Libki::Controller::Administration::Login->new(_app => 'Libki');
++my $logout = Libki::Controller::Administration::Logout->new(_app => 'Libki');
++my $c = TestContext->new;
++$login->index($c);
++like($c->{redirect},qr{/login/entra$},'enabled login starts Microsoft sign-in');
++is($c->{headers}->header('Cache-Control'),'no-store','login is not cached');
++$c=TestContext->new; $c->{config}{'Libki::Entra'}{enabled}=0;
++$login->index($c);
++is($c->{stash}{template},'administration/login.tt','disabled feature keeps local login');
++ok(!$c->{redirect},'disabled feature does not redirect to Microsoft');
++$c=TestContext->new; $c->{params}={username=>'localadmin',password=>'test-only'};$c->{password_ok}=1;
++$login->emergency($c);
++ok(!$c->{authenticate_calls},'GET credentials are not processed');
++$c->{method}='POST';$login->emergency($c);
++ok($c->{authenticate_calls},'local recovery uses normal authentication');
++is($c->{session}{staff_auth_source},'Local account','recovery session is distinguished');
++$c=TestContext->new;$c->{method}='POST';$c->{params}={username=>'entra-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',password=>'test-only'};
++$login->emergency($c);
++ok(!$c->{authenticate_calls},'shadow account cannot use password recovery route');
++$c=TestContext->new;$c->{params}{target_url}='https://attacker.example/';
++$login->entra($c);
++is($c->{authorize}{target_url},'https://staff.example.org/administration/login/entra/complete','caller cannot choose redirect target');
++$c=TestContext->new;$login->entra_complete($c);
++is($c->{status},401,'completion without verified identity is denied');
++sub identity { bless {claims=>{tid=>'11111111-2222-4333-8444-555555555555',oid=>'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',exp=>time+3600,roles=>['Libki.Staff'],@_}}, 'TestIdentity' }
++$c=TestContext->new;$c->{identity}=identity(roles=>['unassigned']);$login->entra_complete($c);
++is($c->{status},403,'verified but unassigned user is denied');
++ok(!$c->{authenticated},'denied identity has no staff session');
++$c=TestContext->new;$c->{identity}=identity(exp=>time-1);$login->entra_complete($c);
++is($c->{status},401,'expired identity is denied');
++{
++    no warnings 'redefine';
++    local *Libki::Auth::Entra::sync_user = sub { return bless {}, 'TestUser' };
++    $c=TestContext->new;$c->{identity}=identity();$c->{wrapper}=bless {},'TestUser';
++    $login->entra_complete($c);
++    ok($c->{authenticated},'verified assigned identity establishes Catalyst authentication');
++    is_deeply($c->{events},['rotate','auth'],'session rotates before authentication');
++    ok(!$c->{identity},'provider identity is removed after completion');
++    ok($c->{session}{staff_entra_expires_at}>time,'absolute identity expiry retained');
++    is($c->{audit}{action},'ADMIN_LOGIN','staff login audited without tokens');
++    $login->entra_complete($c);
++    is($c->{status},401,'completion identity cannot be replayed');
++    $c=TestContext->new;$c->{identity}=identity();$c->{wrapper}=bless {},'TestUser';$c->{fail_auth}=1;
++    $login->entra_complete($c);
++    is($c->{status},500,'authentication failure is handled');
++    ok(!$c->{authenticated},'failed authentication leaves no new staff identity');
++}
++$c=TestContext->new;$c->{flash}{error_message}='private provider response';
++$login->entra_error($c);
++ok(!exists $c->{flash}{error_message},'raw provider error removed');
++unlike(join(' ',@{$c->{logs}}),qr/private provider/,'raw provider error not logged');
++$c=TestContext->new;$c->{session}={oidc=>{token=>'synthetic'},oidc_auth=>{pending=>1}};$c->{authenticated}=1;
++$logout->index($c);
++ok($c->{deleted_session} && !$c->{authenticated},'logout destroys authenticated session');
++is_deeply($c->{session},{},'logout discards tokens and unfinished flows');
++like($c->{redirect},qr{/signed-out$},'SSO logout does not immediately sign in again');
++$c=TestContext->new;$c->{session}={staff_auth_source=>'Microsoft Entra ID',staff_entra_expires_at=>time-1};$c->{authenticated}=1;
++# Controller identity check in auto expects distinct objects.
++{
++    no warnings 'redefine';
++    local *TestContext::controller = sub { $_[1] ? 'login-controller' : 'administration-controller' };
++    is(Libki::Controller::Administration->new(_app => 'Libki')->auto($c),0,'expired staff session stops protected action');
++    ok($c->{deleted_session} && !$c->{authenticated},'expiry removes staff identity');
++}
++done_testing;
+diff --git a/t/entra_oidc.t b/t/entra_oidc.t
+new file mode 100644
+index 0000000..e09400f
+--- /dev/null
++++ b/t/entra_oidc.t
+@@ -0,0 +1,72 @@
++use strict;
++use warnings;
++use Test::More;
++use lib 'lib';
++use Libki::Auth::EntraConfig;
++use OIDC::Client;
++use OIDC::Client::Plugin;
++use Crypt::PK::RSA;
++use Crypt::JWT qw(encode_jwt);
++use JSON qw(decode_json);
++use Mojo::URL;
++use Catalyst::Log;
++my $log = Catalyst::Log->new(qw/error/);
++
++# Ephemeral signing key and synthetic metadata: no network, tenant, or saved key.
++my $key = Crypt::PK::RSA->new;
++$key->generate_key(256,65537);
++my $jwk = decode_json($key->export_key_jwk('public'));
++$jwk->{kid}='ephemeral-test';
++my $tenant='11111111-2222-4333-8444-555555555555';
++my $id='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
++my (undef,$config) = Libki::Auth::EntraConfig->from_env({
++    LIBKI_ENTRA_ENABLED=>1,LIBKI_ENTRA_TENANT_ID=>$tenant,
++    LIBKI_ENTRA_CLIENT_ID=>$id,OIDC_ENTRA_SECRET=>'test-only',
++});
++my $issuer="https://login.microsoftonline.com/$tenant/v2.0";
++my $client=OIDC::Client->new(log=>$log,
++    config=>{%{$config->{provider}{ENTRA}},provider=>'ENTRA'},
++    provider_metadata=>{issuer=>$issuer,authorize_url=>'https://identity.example.org/authorize'},
++    kid_keys=>{keys=>[$jwk]},
++);
++sub token {
++    my (%changes)=@_;
++    encode_jwt(payload=>{iss=>$issuer,aud=>$id,sub=>'test-subject',iat=>time,exp=>time+3600,
++        nonce=>'test-nonce',%changes},key=>$key,alg=>'RS256',extra_headers=>{kid=>'ephemeral-test'});
++}
++sub verify {
++    $client->verify_jwt_token(token=>$_[0],expected_audience=>$id,expected_authorized_party=>$id,
++        no_authorized_party_accepted=>1,expected_nonce=>'test-nonce',max_token_age=>600);
++}
++ok(verify(token()),'valid signed ID token accepted by actual OIDC dependency');
++for my $case (
++    ['wrong issuer',iss=>'https://identity.example.org/wrong'],
++    ['wrong audience',aud=>'another-client'],
++    ['wrong nonce',nonce=>'wrong'],
++    ['expired token',exp=>time-120],
++    ['old issue time',iat=>time-1000],
++    ['wrong authorized party',azp=>'another-client'],
++) {
++    my ($label,@changes)=@$case;
++    eval { verify(token(@changes)) };
++    ok($@,"$label rejected");
++}
++my $bad=token(); my @parts=split /\./,$bad; substr($parts[2],0,1)=substr($parts[2],0,1) eq 'A'?'B':'A';
++eval { verify(join('.',@parts)) };
++ok($@,'bad signature rejected');
++my $session={}; my $url;
++my $plugin=OIDC::Client::Plugin->new(log=>$log,
++    client=>$client,session=>$session,stash=>{},request_params=>{},request_headers=>{},
++    base_url=>'https://staff.example.org/',current_url=>'https://staff.example.org/administration/login/entra',
++    redirect=>sub {$url=shift},
++);
++$plugin->redirect_to_authorize(target_url=>'https://staff.example.org/administration/login/entra/complete');
++my $query=Mojo::URL->new($url)->query;
++is($query->param('code_challenge_method'),'S256','real authorize flow uses S256');
++ok(length($query->param('nonce'))>=16,'real authorize flow generates nonce');
++my $state=$query->param('state');
++ok($session->{oidc_auth}{$state}{code_verifier},'PKCE verifier retained server-side');
++$plugin->request_params->{state}='unknown';
++eval {$plugin->get_token};
++ok($@,'unknown callback state rejected before token exchange');
++done_testing;
+diff --git a/t/entra_sync.t b/t/entra_sync.t
+new file mode 100644
+index 0000000..9902709
+--- /dev/null
++++ b/t/entra_sync.t
+@@ -0,0 +1,55 @@
++use strict;
++use warnings;
++use Test::More;
++use lib 'lib';
++use Libki::Auth::Entra;
++{
++    package TestContext;
++    sub new { bless {roles=>{}, user=>undef}, shift }
++    sub instance { 'test-instance' }
++    sub now { '2026-01-01 00:00:00' }
++    sub model { my ($s,$name)=@_; return $s if $name eq 'DB'; bless {c=>$s,name=>$name}, 'TestRS' }
++    sub txn_do { $_[1]->() }
++    package TestUser;
++    sub id { 1 }
++    sub status { $_[0]{status} }
++    sub creation_source { $_[0]{creation_source} }
++    sub update { my ($s,$data)=@_; @{$s}{keys %$data}=values %$data; $s }
++    package TestRole;
++    sub id { $_[0]{id} }
++    package TestRS;
++    sub find {
++        my ($s,$where)=@_;
++        if ($s->{name} eq 'DB::User') {
++            die 'wrong instance' unless $where->{instance} eq 'test-instance';
++            return $s->{c}{user};
++        }
++        return bless {id=>$where->{role}}, 'TestRole';
++    }
++    sub create { my ($s,$data)=@_; $s->{c}{user}=bless {%$data}, 'TestUser' }
++    sub find_or_create { $_[0]{c}{roles}{$_[1]{role_id}}=1 }
++    sub search { $_[0]{filter}=$_[1]; $_[0] }
++    sub delete { delete $_[0]{c}{roles}{$_[0]{filter}{role_id}} }
++}
++my $ctx = TestContext->new;
++my $decision = {
++    authorized=>1,username=>'entra-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
++    firstname=>'Example',lastname=>'Staff',libki_roles=>[qw/admin superadmin/],
++};
++my $u = Libki::Auth::Entra->sync_user($ctx,$decision);
++is($u->{creation_source},'entra','new account belongs to Entra');
++is($u->{instance},'test-instance','account scoped to instance');
++ok(length($u->{password})>=48,'new account receives high-entropy random password');
++is_deeply([sort keys %{$ctx->{roles}}],[qw/admin superadmin/],'administrator receives both roles');
++Libki::Auth::Entra->sync_user($ctx,{%$decision,libki_roles=>['admin']});
++is_deeply([keys %{$ctx->{roles}}],['admin'],'downgrade removes superadmin role');
++$u->{status}='disabled';
++eval { Libki::Auth::Entra->sync_user($ctx,$decision) };
++like($@,qr/locally disabled/,'locally disabled identity cannot sign in');
++is($u->{status},'disabled','disabled account is not re-enabled');
++$u->{status}='enabled'; $u->{creation_source}='manual';
++eval { Libki::Auth::Entra->sync_user($ctx,$decision) };
++like($@,qr/non-Entra account/,'local account collision fails closed');
++eval { Libki::Auth::Entra->sync_user($ctx,{authorized=>0}) };
++like($@,qr/not authorized/,'unauthorized decision cannot provision');
++done_testing;

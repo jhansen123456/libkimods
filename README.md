@@ -2,6 +2,10 @@
 
 Focused, reusable additions for [Libki Server](https://github.com/Libki/libki-server) and [Libki Client](https://github.com/Libki/libki-client).
 
+## Staff Microsoft Entra single sign-on
+
+[Review the Entra contribution](contributions/staff-entra-sso/README.md), including its source patch, setup instructions, dependencies, and tests. This is the same sanitized version submitted in [upstream draft PR #507](https://github.com/Libki/libki-server/pull/507). It adds optional Microsoft sign-in for staff and leaves patron authentication unchanged. Live Entra acceptance testing is still required for this portable export.
+
 ## Printing contributions — review drafts
 
 The printing packages are available here for review and have not been submitted to the main Libki project.
