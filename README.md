@@ -2,6 +2,17 @@
 
 Focused, reusable additions for [Libki Server](https://github.com/Libki/libki-server) and [Libki Client](https://github.com/Libki/libki-client).
 
+## Printing contributions — review drafts
+
+The printing packages are available here for review and have not been submitted to the main Libki project.
+
+| Contribution | Description and code | Screenshots |
+| --- | --- | --- |
+| Part 1: Staff printing and cash collection | [Review Part 1](contributions/printing/part-1-staff-print-cash/README.md) | [Seven feature screenshots](contributions/printing/part-1-staff-print-cash/SCREENSHOTS.md) |
+| Part 2: Companion mobile printing | [Review Part 2](contributions/printing/part-2-mobile-print/README.md) | [Five feature screenshots](contributions/printing/part-2-mobile-print/SCREENSHOTS.md) |
+
+Start with the screenshots. The [printing series overview](contributions/printing/README.md) links to the source, proposed contribution descriptions, validation results, and remaining preparation. Part 2 still needs generic deployment configuration and verification against upstream Libki.
+
 ## First feature: staff screen viewer
 
 Help a patron explain a problem by viewing their workstation from the Libki staff page. Staff choose a reason, request access, and wait for someone at the workstation to approve the connection. The browser viewer is view-only.

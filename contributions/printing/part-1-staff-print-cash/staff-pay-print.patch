@@ -1,0 +1,3451 @@
+diff --git a/lib/Libki/Controller/Administration.pm b/lib/Libki/Controller/Administration.pm
+index 9a43e1a..11da80b 100644
+--- a/lib/Libki/Controller/Administration.pm
++++ b/lib/Libki/Controller/Administration.pm
+@@ -2,6 +2,7 @@ package Libki::Controller::Administration;
+ use Moose;
+ use namespace::autoclean;
+ use Scalar::Util qw(looks_like_number);
++use JSON qw(to_json);
+ 
+ BEGIN { extends 'Catalyst::Controller'; }
+ 
+@@ -93,6 +94,13 @@ sub auto : Private {
+         }
+     }
+     else {    # If a user doesn't exist, force login
++        if ( $c->action->reverse eq 'administration/api/printjob/preview' ) {
++            $c->response->status(401);
++            $c->response->content_type('application/json; charset=utf-8');
++            $c->response->header('Cache-Control' => 'no-store');
++            $c->response->body(to_json({ success => 0, error => 'STAFF_SESSION_EXPIRED' }));
++            return 0;
++        }
+               # Redirect the user to the login page
+         $c->response->redirect( $c->uri_for('/administration/login') );
+ 
+diff --git a/lib/Libki/Controller/Administration/API/DataTables.pm b/lib/Libki/Controller/Administration/API/DataTables.pm
+index 3c4339e..1ce31b6 100644
+--- a/lib/Libki/Controller/Administration/API/DataTables.pm
++++ b/lib/Libki/Controller/Administration/API/DataTables.pm
+@@ -464,6 +464,11 @@ sub prints : Local Args(0) {
+         $filter->{'print_file.client_location'} = $c->request->param("location_filter");
+     }
+ 
++    $filter->{'me.instance'} = $instance;
++    if (($c->request->param('queue_view') || 'all') eq 'pending') {
++        $filter->{'me.status'} = { '-not_in' => ['Done', 'Canceled'] };
++    }
++
+     # Sorting options
+     my @sorting;
+     my $params = $c->request->params;
+diff --git a/lib/Libki/Controller/Administration/API/PrintJob.pm b/lib/Libki/Controller/Administration/API/PrintJob.pm
+index df4d959..fc315b4 100644
+--- a/lib/Libki/Controller/Administration/API/PrintJob.pm
++++ b/lib/Libki/Controller/Administration/API/PrintJob.pm
+@@ -65,6 +65,8 @@ Initializes the Net::CUPS module with the values from the configuration.
+ 
+ sub cups_setup : Private : Args(0) {
+     my ( $self, $c ) = @_;
++
++    require Net::CUPS;
+     my $instance = $c->instance;
+ 
+     my $printers_conf = $c->get_printer_configuration;
+@@ -97,6 +99,27 @@ sub cups_create_print_file : Private : Args(0) {
+ 
+ }
+ 
++=head2 preview
++
++Return a side-effect-free staff review of a held print job.
++
++=cut
++
++sub preview : Local : Args(0) {
++    my ( $self, $c ) = @_;
++
++    $c->assert_user_roles(qw/admin/);
++
++    my $data = Libki::Utils::Printing::build_release_preview(
++        $c,
++        { print_job_id => $c->request->params->{id}, copies => $c->request->params->{copies} }
++    );
++    # Return only the quote; never serialize unrelated settings from the stash.
++    $c->response->content_type('application/json; charset=utf-8');
++    $c->response->header('Cache-Control' => 'no-store');
++    $c->response->body(to_json($data));
++}
++
+ =head2 release
+ 
+ Sends the given print job to the actual print management backend.
+@@ -106,14 +129,131 @@ Sends the given print job to the actual print management backend.
+ sub release : Local : Args(0) {
+     my ( $self, $c ) = @_;
+ 
++    $c->assert_user_roles(qw/admin/);
++
++    unless ( $c->request->method eq 'POST' ) {
++        $c->response->status(405);
++        $c->stash( success => 0, error => 'METHOD_NOT_ALLOWED' );
++        $c->forward( $c->view('JSON') );
++        return;
++    }
++
++    unless (
++        ( $c->request->headers->header('X-Requested-With') || q{} )
++        eq 'XMLHttpRequest'
++    ) {
++        $c->response->status(400);
++        $c->stash( success => 0, error => 'INVALID_RELEASE_REQUEST' );
++        $c->forward( $c->view('JSON') );
++        return;
++    }
++
++    my $printers = $c->get_printer_configuration;
++    unless ( ( $printers->{staff_print_release} || 'disabled' ) eq 'enabled' ) {
++        $c->stash(
++            success => 0,
++            error   => 'STAFF_PRINT_RELEASE_DISABLED',
++        );
++        $c->forward( $c->view('JSON') );
++        return;
++    }
++
++    unless ( ( $c->request->params->{cash_received} || q{} ) eq '1' ) {
++        $c->stash(
++            success => 0,
++            error   => 'CASH_PAYMENT_NOT_CONFIRMED',
++        );
++        $c->forward( $c->view('JSON') );
++        return;
++    }
++
+     my $id = $c->request->params->{id};
+ 
+-    my $data = Libki::Utils::Printing::release( $c, { print_job_id => $id } );
++    my $data = Libki::Utils::Printing::release(
++        $c,
++        {
++            print_job_id    => $id,
++            payment_method  => 'cash',
++            expected_amount => $c->request->params->{expected_amount},
++            copies => $c->request->params->{copies},
++            request_id => $c->request->params->{request_id},
++        }
++    );
+     $c->stash( $data );
+ 
+     $c->forward( $c->view('JSON') );
+ }
+ 
++=head2 reprint
++
++Create a new audited held job from a completed CUPS job and immediately send
++that new job through the normal cash-confirmed production release path.
++
++=cut
++
++sub reprint : Local : Args(0) {
++    my ( $self, $c ) = @_;
++
++    $c->assert_user_roles(qw/admin/);
++
++    unless ( $c->request->method eq 'POST' ) {
++        $c->response->status(405);
++        $c->stash( success => 0, error => 'METHOD_NOT_ALLOWED' );
++        $c->forward( $c->view('JSON') );
++        return;
++    }
++
++    unless (
++        ( $c->request->headers->header('X-Requested-With') || q{} )
++        eq 'XMLHttpRequest'
++    ) {
++        $c->response->status(400);
++        $c->stash( success => 0, error => 'INVALID_REPRINT_REQUEST' );
++        $c->forward( $c->view('JSON') );
++        return;
++    }
++
++    unless ( ( $c->request->params->{cash_received} || q{} ) eq '1' ) {
++        $c->stash( success => 0, error => 'CASH_PAYMENT_NOT_CONFIRMED' );
++        $c->forward( $c->view('JSON') );
++        return;
++    }
++
++    my $created = Libki::Utils::Printing::create_reprint_job(
++        $c,
++        {
++            print_job_id    => $c->request->params->{id},
++            expected_amount => $c->request->params->{expected_amount},
++            copies => $c->request->params->{copies},
++            request_id => $c->request->params->{request_id},
++        }
++    );
++    unless ( $created->{success} ) {
++        $c->stash($created);
++        $c->forward( $c->view('JSON') );
++        return;
++    }
++
++    my $existing = $c->model('DB::PrintJob')->find({ id => $created->{reprint_job_id}, instance => $c->instance });
++    if ($existing && ($existing->status eq 'Done' || $existing->status eq 'InProgress')) {
++        $c->stash(success => 1, reprint_job_id => $existing->id, message => 'This reprint request was already accepted.');
++        $c->forward($c->view('JSON'));
++        return;
++    }
++    my $released = Libki::Utils::Printing::release(
++        $c,
++        {
++            print_job_id    => $created->{reprint_job_id},
++            payment_method  => 'cash',
++            expected_amount => $created->{amount_due},
++        }
++    );
++    $released->{source_print_job_id} = $created->{source_print_job_id};
++    $released->{reprint_job_id}      = $created->{reprint_job_id};
++    $c->stash($released);
++    $c->forward( $c->view('JSON') );
++}
++
+ =head2 update
+ 
+ Updates the status of a print job from the backend print management system.
+@@ -126,6 +266,16 @@ sub update : Local : Args(0) {
+     my $instance = $c->instance;
+ 
+     my $print_job_id = $c->request->params->{id};
++    unless ( defined $print_job_id && $print_job_id =~ m{\A\d+\z} ) {
++        $c->response->status(400);
++        $c->stash(
++            success => 0,
++            error   => 'INVALID_PRINT_JOB_ID',
++        );
++        delete $c->stash->{Settings};
++        $c->forward( $c->view('JSON') );
++        return;
++    }
+ 
+     my $print_job = $c->model('DB::PrintJob')->find($print_job_id);
+     if ($print_job) {
+diff --git a/lib/Libki/Utils/Printing.pm b/lib/Libki/Utils/Printing.pm
+index 488a070..df56736 100644
+--- a/lib/Libki/Utils/Printing.pm
++++ b/lib/Libki/Utils/Printing.pm
+@@ -2,9 +2,8 @@ package Libki::Utils::Printing;
+ 
+ use Modern::Perl;
+ 
+-use File::Slurp qw( write_file );
+ use File::Temp qw( tempfile );
+-use JSON qw( to_json );
++use JSON qw( to_json from_json );
+ use PDF::API2;
+ use Try::Tiny;
+ 
+@@ -16,6 +15,88 @@ use constant PRINT_STATUS_CANCELED    => 'Canceled';    # Canceled by user
+ use constant PRINT_STATUS_IN_PROGRESS => 'InProgress';  # Print job is being sent to printer
+ use constant PRINT_STATUS_DONE        => 'Done';        # Printer has accepted the print job
+ 
++use constant MAX_PRINT_PDF_BYTES => 25 * 1024 * 1024;
++use constant MAX_PRINT_PDF_PAGES => 1000;
++
++=head2 inspect_pdf_data
++
++Validate an uploaded PDF and return its positive page count.  The client does
++not send a trustworthy multipart MIME type, so validation uses a bounded body,
++a PDF header, and two independent PDF parsers.  No filename or document data is
++passed through a shell.
++
++=cut
++
++sub inspect_pdf_data {
++    my ($pdf_string) = @_;
++
++    return unless defined $pdf_string;
++    my $bytes = length($pdf_string);
++    return unless $bytes > 0 && $bytes <= MAX_PRINT_PDF_BYTES;
++
++    my $header = substr( $pdf_string, 0, 1024 );
++    return unless $header =~ /%PDF-(?:1[.][0-7]|2[.]0)/;
++
++    my $pages;
++    try {
++        my $pdf = PDF::API2->open_scalar($pdf_string);
++        $pages = $pdf->pages();
++    }
++    catch {
++        $pages = undef;
++    };
++
++    $pages = _pdfinfo_pages($pdf_string)
++        unless defined $pages && $pages =~ /^[0-9]+$/ && $pages > 0;
++
++    return unless defined $pages && $pages =~ /^[0-9]+$/;
++    return unless $pages > 0 && $pages <= MAX_PRINT_PDF_PAGES;
++    return int($pages);
++}
++
++sub safe_pdf_filename {
++    my ($filename) = @_;
++    return unless defined $filename && length($filename) <= 1024;
++
++    $filename =~ s{.*[\\/]}{};
++    my ($stem) = $filename =~ /^(.*)[.]pdf$/i;
++    return unless defined $stem;
++
++    $stem =~ s/[^A-Za-z0-9._ ()-]+/_/g;
++    $stem =~ s/^[.]+/_/;
++    $stem = substr( $stem, 0, 196 );
++    $stem = 'print' unless length $stem;
++
++    return "$stem.pdf";
++}
++
++sub _pdfinfo_pages {
++    my ($pdf_string) = @_;
++
++    my ( $fh, $filename ) = tempfile( SUFFIX => '.pdf', UNLINK => 1 );
++    binmode $fh;
++    print {$fh} $pdf_string or return;
++    close $fh or return;
++
++    open my $pdfinfo, '-|', '/usr/bin/pdfinfo', $filename or return;
++    my $pages;
++    while ( my $line = <$pdfinfo> ) {
++        $pages = $1 if $line =~ /^Pages:[[:space:]]+([0-9]+)[[:space:]]*$/;
++    }
++    my $ok = close $pdfinfo;
++
++    return $ok ? $pages : undef;
++}
++
++sub _reject_print_upload {
++    my ( $c, $error ) = @_;
++    $c->stash(
++        success => 0,
++        error   => $error,
++    );
++    return;
++}
++
+ =head2 create_print_job_and_file
+ 
+ Helper function to create a print_job and print_file entry from the given PDF and data.
+@@ -28,152 +109,150 @@ or by uploading a file to print via the public self-service web interface
+ sub create_print_job_and_file {
+     my ( $c, $params ) = @_;
+ 
+-    my $client      = $params->{client};         # DB::Client object, optional
+-    my $client_name = $params->{client_name};    # Client name file was printed from, if any
+-    my $copies      = $params->{copies};         # How many copies of this file are to be printed
+-    my $print_file  = $params->{print_file};     # Catalyst::Request::Upload object
+-    my $printer_id  = $params->{printer_id};     # Printer id from printer configuration setting
+-    my $user        = $params->{user};           # DB::User object, optional
+-    my $username    = $params->{username};       # User's username
+-
++    my $client      = $params->{client};
++    my $client_name = $params->{client_name};
++    my $copies      = $params->{copies};
++    my $print_file  = $params->{print_file};
++    my $printer_id  = $params->{printer_id};
++    my $user        = $params->{user};
++    my $job_data    = $params->{data};
++    my $username    = $params->{username};
+ 
+-    $copies ||= 1;    # Default to 1 copy if no cromulent value is passed in
+-    $copies = 1 unless $copies =~ /^\d+$/; # Set to default if copies is non-numeric
++    $copies ||= 1;
++    $copies = 1
++        unless $copies =~ /^[0-9]+$/ && $copies >= 1 && $copies <= 99;
+ 
+     my $instance = $c->instance;
+-
+-    my $now = $c->now();
++    my $now      = $c->now();
+ 
+     if ( $client_name eq PRINT_FROM_WEB ) {
+-        $client = undef;    # Printing from the web does not require a client
++        $client = undef;
+     }
+     else {
+-        $client ||= $c->model('DB::Client')    # Fetch the client if it was not passed in
++        $client ||= $c->model('DB::Client')
+             ->single( { instance => $instance, name => $client_name } );
+     }
+ 
+-    $user ||= $c->model('DB::User')            # Fetch the user if they were not passed in
++    $user ||= $c->model('DB::User')
+         ->single( { instance => $instance, username => $username } );
+ 
+-    if ($user) {
+-        my $pdf_string = $print_file->decoded_slurp;
++    return _reject_print_upload( $c, 'CLIENT_NOT_FOUND' ) unless $user;
++    return _reject_print_upload( $c, 'MISSING_PRINT_FILE' ) unless $print_file;
+ 
+-        my $pages;
+-        try {
+-            my $pdf = PDF::API2->open_scalar($pdf_string);
+-            $pages = $pdf->pages();
+-        }
+-        catch { # PDF may be encrypted, try using pdfinfo instead
+-            my ( $fh, $fn ) = tempfile();
+-            write_file( $fn, $pdf_string );
+-            my $pages = qx{ pdfinfo $fn | awk '/^Pages:/ {print \$2}' };
+-            chomp $pages;
+-        };
++    my $filename = safe_pdf_filename( eval { $print_file->filename } );
++    return _reject_print_upload( $c, 'INVALID_PDF' ) unless $filename;
+ 
+-        my $printers = $c->get_printer_configuration;
+-        my $printer  = $printers->{printers}->{$printer_id};
++    my $pdf_string = eval { $print_file->decoded_slurp };
++    return _reject_print_upload( $c, 'INVALID_PDF' )
++        unless defined $pdf_string;
+ 
+-        my $client_id       = $client ? $client->id       : undef;
+-        my $client_type     = $client ? $client->type     : undef;
+-        my $client_location = $client && $client->location ? $client->location->code : undef;
++    my $pages = inspect_pdf_data($pdf_string);
++    return _reject_print_upload( $c, 'INVALID_PDF' ) unless $pages;
+ 
+-        my $print_job;
+-        if ($printer) {
+-            my $printer_location = $printer->{location};
+-            my $printfile_location = $printer_location ? $printer_location : $client_location;
++    my $printers = $c->get_printer_configuration;
++    my $printer  = $printers->{printers}->{$printer_id};
++    return _reject_print_upload( $c, 'INVALID_PRINTER' ) unless $printer;
++
++    if ( $client && $printer->{allowed_client_locations} ) {
++        my @allowed_locations = ref $printer->{allowed_client_locations} eq 'ARRAY'
++            ? @{ $printer->{allowed_client_locations} }
++            : ( $printer->{allowed_client_locations} );
++        my $client_location = $client->location
++            ? $client->location->code
++            : q{};
++
++        return _reject_print_upload(
++            $c, 'PRINTER_NOT_AVAILABLE_AT_CLIENT_LOCATION'
++        ) unless grep { defined $_ && $_ eq $client_location }
++            @allowed_locations;
++    }
+ 
+-            $c->model('DB')->txn_do(
+-                sub {
+-                    $print_file = $c->model('DB::PrintFile')->create(
++    my $client_id       = $client ? $client->id       : undef;
++    my $client_type     = $client ? $client->type     : undef;
++    my $client_location = $client && $client->location
++        ? $client->location->code
++        : undef;
++    my $printer_location  = $printer->{location};
++    my $printfile_location = $printer_location
++        ? $printer_location
++        : $client_location;
++
++    my $print_job;
++    $c->model('DB')->txn_do(
++        sub {
++            $print_file = $c->model('DB::PrintFile')->create(
++                {
++                    instance        => $instance,
++                    filename        => $filename,
++                    content_type    => 'application/pdf',
++                    data            => $pdf_string,
++                    pages           => $pages,
++                    client_id       => $client_id,
++                    client_name     => $client_name,
++                    client_location => $printfile_location,
++                    client_type     => $client_type,
++                    user_id         => $user->id,
++                    username        => $username,
++                    created_on      => $now,
++                    updated_on      => $now,
++                }
++            );
++
++            $print_job = $c->model('DB::PrintJob')->create(
++                {
++                    instance      => $instance,
++                    type          => $printer->{type},
++                    status        => PRINT_STATUS_HELD,
++                    data          => $job_data,
++                    copies        => $copies,
++                    printer       => $printer_id,
++                    user_id       => $user->id,
++                    print_file_id => $print_file->id,
++                    created_on    => $now,
++                    updated_on    => $now,
++                }
++            );
++
++            $c->model('DB::Statistic')->create(
++                {
++                    instance   => $c->instance,
++                    username   => $username,
++                    action     => 'PRINT_JOB_CREATED',
++                    created_on => $c->now,
++                    session_id => scalar $c->sessionid,
++                    info       => to_json(
+                         {
+-                            instance        => $instance,
+-                            filename        => $print_file->filename,
+-                            content_type    => $print_file->type,
+-                            data            => $pdf_string,
+-                            pages           => $pages,
++                            print_job_id    => $print_job->id,
++                            print_file_id   => $print_file->id,
+                             client_id       => $client_id,
+-                            client_name     => $client_name,
+                             client_location => $printfile_location,
++                            client_name     => $client_name,
+                             client_type     => $client_type,
++                            content_type    => $print_file->content_type,
++                            copies          => $copies,
++                            filename        => $print_file->filename,
++                            pages           => $pages,
++                            printer         => $printer_id,
+                             user_id         => $user->id,
+-                            username        => $username,
+-                            created_on      => $now,
+-                            updated_on      => $now,
+-                        }
+-                    );
+-
+-                    $print_job = $c->model('DB::PrintJob')->create(
+-                        {
+-                            instance      => $instance,
+-                            type          => $printer->{type},
+-                            status        => PRINT_STATUS_HELD,
+-                            data          => undef,
+-                            copies        => $copies,
+-                            printer       => $printer_id,
+-                            user_id       => $user->id,
+-                            print_file_id => $print_file->id,
+-                            created_on    => $now,
+-                            updated_on    => $now,
+-                        }
+-                    );
+-
+-                    $c->model('DB::Statistic')->create(
+-                        {
+-                            instance   => $c->instance,
+-                            username   => $username,
+-                            action     => 'PRINT_JOB_CREATED',
+-                            created_on => $c->now,
+-                            session_id => $c->sessionid,
+-                            info       => to_json(
+-                                {
+-                                    print_job_id    => $print_job->id,
+-                                    print_file_id   => $print_file->id,
+-                                    client_id       => $client_id,
+-                                    client_location => $printfile_location,
+-                                    client_name     => $client_name,
+-                                    client_type     => $client_type,
+-                                    content_type    => $print_file->content_type,
+-                                    copies          => $copies,
+-                                    filename        => $print_file->filename,
+-                                    pages           => $pages,
+-                                    printer         => $printer_id,
+-                                    user_id         => $user->id,
+-                                }
+-                            ),
+                         }
+-                    );
++                    ),
+                 }
+             );
+         }
+-        else {
+-            $c->log->error(
+-                sprintf(
+-                    "User id %s printed to non-existent printer id %s from client %s",
+-                    $user->id, $printer_id, $client ? $client->id : 'Print From Web'
+-                )
+-            );
+-        }
+-
+-        if ( $print_job && $printer->{auto_release}
+-            && (  $printer->{auto_release} eq 'yes'
+-                || ( $printer->{auto_release} eq 'client' && $client_name ne PRINT_FROM_WEB ) 
+-                || ( $printer->{auto_release} eq 'public' && $client_name eq PRINT_FROM_WEB ) 
+-            ) ) {
++    );
+ 
+-            #FIXME: Allow passing the print job object to release instead of re-fetching it
+-            release( $c, { print_job_id => $print_job->id, user => $user } );
+-        }
++    if ( $print_job && $printer->{auto_release}
++        && (  $printer->{auto_release} eq 'yes'
++            || ( $printer->{auto_release} eq 'client' && $client_name ne PRINT_FROM_WEB )
++            || ( $printer->{auto_release} eq 'public' && $client_name eq PRINT_FROM_WEB )
++        ) ) {
+ 
+-        $c->stash( success => 1 );
++        # FIXME: Allow passing the print job object to release instead of re-fetching it.
++        release( $c, { print_job_id => $print_job->id, user => $user } );
+     }
+-    else {
+ 
+-        $c->stash(
+-            success => 0,
+-            error   => 'CLIENT NOT FOUND',
+-            client  => "$instance/$client_name"
+-        );
+-    }
++    $c->stash( success => 1 );
++    return $print_job;
+ }
+ 
+ =head2 calculate_job_cost
+@@ -207,7 +286,7 @@ sub calculate_job_cost {
+ 
+     $print_file ||= $print_job->print_file;
+     my $pages  = $print_file->pages        || 1;
+-    my $copies = $print_job->copies        || 1;
++    my $copies = $params->{copies} // ($print_job->copies || 1);
+     my $cpp    = $printer->{cost_per_page} || 0;
+ 
+     my $total_pages = $pages * $copies;
+@@ -240,6 +319,358 @@ sub calculate_job_cost {
+     return ($cost, $gratis_discount);
+ }
+ 
++=head2 printer_allows_location
++
++Return true when a printer is available to the location recorded on a print
++file. Printers without an allow-list retain the upstream unrestricted
++behavior.
++
++=cut
++
++sub printer_allows_location {
++    my ( $printer, $client_location ) = @_;
++
++    return 0 unless $printer;
++    return 1 unless exists $printer->{allowed_client_locations};
++
++    my @allowed_locations = ref $printer->{allowed_client_locations} eq 'ARRAY'
++        ? @{ $printer->{allowed_client_locations} }
++        : ( $printer->{allowed_client_locations} );
++
++    return ( scalar grep {
++        defined $_ && defined $client_location && $_ eq $client_location
++    } @allowed_locations ) ? 1 : 0;
++}
++
++=head2 cups_job_options
++
++Build the server-authoritative CUPS options for a configured queue. These
++options override choices embedded by the Windows print dialog so that a B&W
++queue cannot accidentally submit color and City queues remain one-sided.
++
++=cut
++
++sub cups_job_options {
++    my ( $print_job, $printer ) = @_;
++
++    my %options = ( copies => int( $print_job->copies || 1 ) );
++
++    my $chroming = lc( $printer->{chroming} || q{} );
++    $options{'print-color-mode'} = 'monochrome'
++        if $chroming eq 'monochrome';
++    $options{'print-color-mode'} = 'color'
++        if $chroming eq 'color';
++
++    my $plexing = lc( $printer->{plexing} || q{} );
++    $options{sides} = 'one-sided'
++        if $plexing eq 'simplex';
++    $options{sides} = 'two-sided-long-edge'
++        if $plexing eq 'duplex';
++
++    return \%options;
++}
++
++=head2 build_release_preview
++
++Build the authoritative, side-effect-free staff review payload for one print
++job. This intentionally performs no accounting and never contacts CUPS.
++
++=cut
++
++sub requested_copies {
++    my ($value, $fallback) = @_;
++    return $fallback unless defined $value;
++    return undef unless $value =~ /\A[0-9]{1,2}\z/ && $value >= 1 && $value <= 99;
++    return 0 + $value;
++}
++
++sub build_release_preview {
++    my ( $c, $params ) = @_;
++
++    my $print_job_id = $params->{print_job_id};
++    my $instance     = $c->instance;
++    my $print_job    = $c->model('DB::PrintJob')->find(
++        { id => $print_job_id, instance => $instance }
++    );
++
++    return {
++        success => 0,
++        error   => 'PRINT_JOB_NOT_FOUND',
++        id      => $print_job_id,
++    } unless $print_job;
++
++    my $print_file = $c->model('DB::PrintFile')->find(
++        $print_job->print_file_id
++    );
++    return {
++        success => 0,
++        error   => 'PRINT_FILE_NOT_FOUND',
++        id      => $print_job->print_file_id,
++    } unless $print_file;
++
++    my $printers = $c->get_printer_configuration;
++    my $printer  = $printers->{printers}->{ $print_job->printer };
++    return {
++        success => 0,
++        error   => 'PRINTER_NOT_FOUND',
++        id      => $print_job->printer,
++    } unless $printer;
++
++    my $client_location = $print_file->client_location;
++    return {
++        success => 0,
++        error   => 'PRINTER_NOT_AVAILABLE_AT_CLIENT_LOCATION',
++        id      => $print_job->printer,
++    } unless printer_allows_location( $printer, $client_location );
++
++    my $user = $print_job->user;
++    return {
++        success => 0,
++        error   => 'PRINT_USER_NOT_FOUND',
++        id      => $print_job->user_id,
++    } unless $user;
++
++    my $requested_copies = requested_copies($params->{copies}, $print_job->copies || 1);
++    return { success => 0, error => 'INVALID_COPIES' } unless defined $requested_copies;
++    my ( $amount_due, $gratis_discount ) = calculate_job_cost(
++        $c,
++        {
++            print_job  => $print_job,
++            copies     => $requested_copies,
++            print_file => $print_file,
++            printer    => $printer,
++        }
++    );
++
++    my $firstname   = eval { $user->firstname } || q{};
++    my $lastname    = eval { $user->lastname }  || q{};
++    my $patron_name = join q{ }, grep { length } ( $firstname, $lastname );
++    $patron_name = $user->username unless length $patron_name;
++
++    my $staff_release_enabled
++        = ( $printers->{staff_print_release} || 'disabled' ) eq 'enabled'
++        ? 1
++        : 0;
++    my $pages  = $print_file->pages || 1;
++    my $copies = $requested_copies;
++    my $print_data = $print_file->data;
++    my $job_data = $print_job->data;
++    my $is_mobile_print
++        = ref($job_data) eq 'HASH'
++        && ($job_data->{source} // q{}) eq 'mobileprint'
++        ? 1
++        : 0;
++    my $release_allowed
++        = $staff_release_enabled && $print_job->status eq PRINT_STATUS_HELD
++        ? 1
++        : 0;
++    my $reprint_allowed
++        = $staff_release_enabled
++        && $print_job->status eq PRINT_STATUS_DONE
++        && $print_job->type eq 'cups'
++        && defined $print_data
++        && length $print_data
++        ? 1
++        : 0;
++
++    return {
++        success                     => 1,
++        print_job_id                => $print_job->id,
++        status                      => $print_job->status,
++        printer_id                  => $print_job->printer,
++        printer_name                => $printer->{public_printer_name} || $print_job->printer,
++        release_location            => $printer->{release_location} || $client_location || q{},
++        client_name                 => $print_file->client_name || q{},
++        client_location             => $client_location || q{},
++        library_card                => $user->username,
++        identifier_label            => $is_mobile_print ? 'Phone number' : 'Library card number',
++        mobile_file_count           => $is_mobile_print
++            ? 0 + ($job_data->{mobileprint_file_count} || 1)
++            : undef,
++        patron_name                 => $patron_name,
++        filename                    => $print_file->filename,
++        pages                       => 0 + $pages,
++        copies                      => 0 + $copies,
++        total_pages                 => 0 + ( $pages * $copies ),
++        amount_due                  => sprintf( '%.2f', $amount_due ),
++        gratis_discount             => sprintf( '%.2f', $gratis_discount ),
++        staff_print_release_enabled => $staff_release_enabled,
++        release_allowed             => $release_allowed,
++        reprint_allowed             => $reprint_allowed,
++        action_mode                 => $release_allowed ? 'release'
++                                     : $reprint_allowed ? 'reprint'
++                                     : 'review',
++    };
++}
++
++=head2 create_reprint_job
++
++Create a new held print job from a completed CUPS job. The source job remains
++immutable so the original release history is preserved and every reprint has
++its own cash and printer audit trail.
++
++=cut
++
++sub create_reprint_job {
++    my ( $c, $params ) = @_;
++
++    my $source_print_job_id = $params->{print_job_id};
++    my $expected_amount     = $params->{expected_amount};
++    my $instance            = $c->instance;
++
++    return { success => 0, error => 'User does not have rights to reprint this print job.' }
++        unless $c->check_user_roles('admin');
++
++    my $printers = $c->get_printer_configuration;
++    return { success => 0, error => 'STAFF_PRINT_RELEASE_DISABLED' }
++        unless ( $printers->{staff_print_release} || 'disabled' ) eq 'enabled';
++
++    my $source_print_job = $c->model('DB::PrintJob')->find(
++        { id => $source_print_job_id, instance => $instance }
++    );
++    return {
++        success => 0,
++        error   => 'Print Job Not Found',
++        id      => $source_print_job_id,
++    } unless $source_print_job;
++
++    return {
++        success => 0,
++        error   => 'PRINT_JOB_NOT_COMPLETED',
++        id      => $source_print_job_id,
++        status  => $source_print_job->status,
++    } unless $source_print_job->status eq PRINT_STATUS_DONE;
++
++    return {
++        success => 0,
++        error   => 'UNSUPPORTED_REPRINT_JOB_TYPE',
++        id      => $source_print_job_id,
++        type    => $source_print_job->type,
++    } unless $source_print_job->type eq 'cups';
++
++    my $print_file = $c->model('DB::PrintFile')->find(
++        $source_print_job->print_file_id
++    );
++    return {
++        success => 0,
++        error   => 'PRINT_FILE_NOT_FOUND',
++        id      => $source_print_job->print_file_id,
++    } unless $print_file;
++    my $print_data = $print_file->data;
++    return {
++        success => 0,
++        error   => 'PRINT_FILE_DATA_UNAVAILABLE',
++        id      => $source_print_job->print_file_id,
++    } unless defined $print_data && length $print_data;
++
++    my $printer = $printers->{printers}->{ $source_print_job->printer };
++    return {
++        success => 0,
++        error   => 'PRINTER_NOT_FOUND',
++        id      => $source_print_job->printer,
++    } unless $printer;
++    return {
++        success => 0,
++        error   => 'PRINTER_NOT_AVAILABLE_AT_CLIENT_LOCATION',
++        id      => $source_print_job->printer,
++    } unless printer_allows_location( $printer, $print_file->client_location );
++
++    my $copies = requested_copies($params->{copies}, $source_print_job->copies || 1);
++    return { success => 0, error => 'INVALID_COPIES' } unless defined $copies;
++    my $request_id = $params->{request_id};
++    return { success => 0, error => 'INVALID_REQUEST_ID' }
++        if defined $request_id && $request_id !~ /\A[a-zA-Z0-9-]{16,64}\z/;
++    my ( $amount_due ) = calculate_job_cost(
++        $c,
++        {
++            print_job  => $source_print_job,
++            copies     => $copies,
++            print_file => $print_file,
++            printer    => $printer,
++        }
++    );
++    my $authoritative_amount = sprintf( '%.2f', $amount_due );
++    return {
++        success => 0,
++        error   => 'PRINT_COST_CHANGED',
++        amount_due => $authoritative_amount,
++    } unless defined $expected_amount
++        && $expected_amount =~ /\A[0-9]+(?:[.][0-9]{1,2})?\z/
++        && sprintf( '%.2f', $expected_amount ) eq $authoritative_amount;
++
++    my $now   = $c->now;
++    my $actor = $c->user ? $c->user->username : 'administrative reprint';
++    my $reprint_job;
++
++    $c->model('DB')->txn_do(
++        sub {
++            if (defined $request_id) {
++                # Serialize requests against the immutable source job; audit retains
++                # request identity even after CUPS replaces the new job's data.
++                $c->model('DB::PrintJob')->search(
++                    { id => $source_print_job->id, instance => $instance },
++                    { for => 'update' }
++                )->single;
++                my @prior = $c->model('DB::Statistic')->search({
++                    instance => $instance, action => 'PRINT_JOB_REPRINT_CREATED',
++                    info => { like => '%' . $request_id . '%' },
++                })->all;
++                for my $stat (@prior) {
++                    my $info = eval { from_json($stat->info) } || {};
++                    if (($info->{request_id} || '') eq $request_id
++                        && $info->{source_print_job_id} == $source_print_job->id) {
++                        $reprint_job = $c->model('DB::PrintJob')->find(
++                            { id => $info->{reprint_job_id}, instance => $instance });
++                        return if $reprint_job;
++                    }
++                }
++            }
++            $reprint_job = $c->model('DB::PrintJob')->create(
++                {
++                    instance      => $instance,
++                    type          => $source_print_job->type,
++                    status        => PRINT_STATUS_HELD,
++                    data          => undef,
++                    copies        => $copies,
++                    printer       => $source_print_job->printer,
++                    user_id       => $source_print_job->user_id,
++                    print_file_id => $source_print_job->print_file_id,
++                    created_on    => $now,
++                    updated_on    => $now,
++                }
++            );
++
++            $c->model('DB::Statistic')->create(
++                {
++                    instance   => $instance,
++                    username   => $actor,
++                    action     => 'PRINT_JOB_REPRINT_CREATED',
++                    created_on => $now,
++                    session_id => $c->sessionid,
++                    info       => to_json(
++                        {
++                            source_print_job_id => $source_print_job->id,
++                            reprint_job_id      => $reprint_job->id,
++                            print_file_id       => $source_print_job->print_file_id,
++                            printer             => $source_print_job->printer,
++                            copies              => $copies,
++                            request_id          => $request_id,
++                            amount_due          => $authoritative_amount,
++                        }
++                    ),
++                }
++            );
++        }
++    );
++
++    return {
++        success             => $reprint_job ? 1 : 0,
++        source_print_job_id => $source_print_job->id,
++        reprint_job_id      => $reprint_job ? $reprint_job->id : undef,
++        amount_due          => $authoritative_amount,
++    };
++}
++
+ =head2 cancel
+ 
+ Release a held print job so it can actually be printed.
+@@ -254,6 +685,12 @@ sub cancel {
+     my $print_job
+         = $c->model('DB::PrintJob')->find( { id => $print_job_id, instance => $instance } );
+ 
++    return {
++        success => 0,
++        error   => 'Print Job Not Found',
++        id      => $print_job_id
++    } unless $print_job;
++
+     if ( $user ) {
+         return {
+             success => 0,
+@@ -262,18 +699,18 @@ sub cancel {
+         } unless $print_job->user_id == $user->id;
+     }
+ 
+-    return {
+-        success => 0,
+-        error   => 'Print Job Not Found',
+-        id      => $print_job_id
+-    } unless $print_job;
++    my $cancel_actor = $user
++        ? $user->username
++        : $c->user
++            ? $c->user->username
++            : 'administrative cancellation';
+ 
+     $print_job->status(PRINT_STATUS_CANCELED);
+ 
+     $c->model('DB::Statistic')->create(
+         {
+             instance   => $c->instance,
+-            username   => $user->username,
++            username   => $cancel_actor,
+             action     => 'PRINT_JOB_CANCELED',
+             created_on => $c->now,
+             session_id => $c->sessionid,
+@@ -301,33 +738,36 @@ sub release {
+     my $print_job_id = $params->{print_job_id};
+     my $user         = $params->{user};
+     my $new_printer  = $params->{printer};
++    my $requested_user  = $user;
++    my $payment_method  = $params->{payment_method} || 'account';
++    my $expected_amount = $params->{expected_amount};
+ 
+     my $log  = $c->log();
+-    $log->info("Libki::Utils::Printing::release print_job_id: $params->{print_job_id}, user: $user->username");
++    my $release_actor = $user
++        ? $user->username
++        : $c->user
++            ? $c->user->username
++            : 'administrative release';
++
++    return { success => 0, error => 'INVALID_PAYMENT_METHOD' }
++        unless $payment_method eq 'account' || $payment_method eq 'cash';
++    return { success => 0, error => 'CASH_RELEASE_REQUIRES_STAFF' }
++        if $payment_method eq 'cash' && $requested_user;
++
++    $log->info(
++        "Libki::Utils::Printing::release print_job_id: $print_job_id, user: $release_actor"
++    );
+ 
+     my $instance = $c->instance;
+ 
+     my $print_job
+         = $c->model('DB::PrintJob')->find( { id => $print_job_id, instance => $instance } );
+ 
+-    my $printers = $c->get_printer_configuration;
+-    my $printer  = $printers->{printers}->{ $print_job->printer };
+-
+-    if ($new_printer) {
+-        my $printers = $c->get_printer_configuration;
+-        my $p        = $printers->{printers}->{$new_printer};
+-
+-        if ($p) {
+-            $printer = $p;
+-            $print_job->printer($new_printer);
+-            $print_job->update();
+-        }
+-        else {
+-            $c->log->error(
+-                "Attempt to update printer at release time failed for print job $print_job_id, printer '$new_printer' doesn't exist!"
+-            );
+-        }
+-    }
++    return {
++        success => 0,
++        error   => 'Print Job Not Found',
++        id      => $print_job_id
++    } unless $print_job;
+ 
+     if ( $user ) {
+         return {
+@@ -345,14 +785,43 @@ sub release {
+         $user = $print_job->user;
+     }
+ 
++    my $print_file = $c->model('DB::PrintFile')->find( $print_job->print_file_id );
+     return {
+         success => 0,
+-        error   => 'Print Job Not Found',
+-        id      => $print_job_id
+-    } unless $print_job;
++        error   => 'Print Job Is Not Held',
++        id      => $print_job_id,
++        status  => $print_job->status,
++    } unless $print_job->status eq PRINT_STATUS_HELD;
+ 
++    return {
++        success => 0,
++        error   => 'Unsupported Print Job Type',
++        id      => $print_job_id,
++        type    => $print_job->type,
++    } unless $print_job->type eq 'cups' || $print_job->type eq 'PrintManager';
++
++    my $printers = $c->get_printer_configuration;
++    my $printer  = $printers->{printers}->{ $print_job->printer };
++
++    if ($new_printer) {
++        my $p = $printers->{printers}->{$new_printer};
++
++        unless ($p) {
++            $c->log->error(
++                "Attempt to update printer at release time failed for print job $print_job_id, printer '$new_printer' doesn't exist!"
++            );
++
++            return {
++                success => 0,
++                error   => 'Printer Not Found',
++                id      => $new_printer,
++            };
++        }
++
++        $printer = $p;
++        $print_job->printer($new_printer);
++    }
+ 
+-    my $print_file = $c->model('DB::PrintFile')->find( $print_job->print_file_id );
+ 
+     return {
+         success => 0,
+@@ -368,6 +837,25 @@ sub release {
+         }
+         unless $printer;
+ 
++    return {
++        success => 0,
++        error   => 'PRINTER_NOT_AVAILABLE_AT_CLIENT_LOCATION',
++        id      => $print_job->printer,
++    } unless printer_allows_location( $printer, $print_file->client_location );
++
++    if ( $print_job->type eq 'cups'
++        && ( $printers->{staff_print_release} || 'disabled' ) ne 'enabled' ) {
++        return {
++            success => 0,
++            error   => 'STAFF_PRINT_RELEASE_DISABLED',
++            id      => $print_job_id,
++        };
++    }
++
++    my $copies = requested_copies($params->{copies}, $print_job->copies || 1);
++    return { success => 0, error => 'INVALID_COPIES' } unless defined $copies;
++    return { success => 0, error => 'COPY_CHANGE_REQUIRES_STAFF_CASH' }
++        if defined $params->{copies} && ($payment_method ne 'cash' || $requested_user);
+     my $data = {
+         print_job  => $print_job,
+         print_file => $print_file,
+@@ -377,25 +865,103 @@ sub release {
+     my ($total_cost, $gratis_discount) = calculate_job_cost( $c,
+         {
+             print_job => $print_job,
++            copies    => $copies,
+             printer   => $printer,
+         }
+     );
+ 
++    if ( defined $expected_amount ) {
++        return { success => 0, error => 'INVALID_EXPECTED_AMOUNT' }
++            unless $expected_amount =~ /^[0-9]+(?:[.][0-9]{1,2})?$/;
++
++        my $expected_cents = int( ( $expected_amount * 100 ) + 0.5 );
++        my $current_cents  = int( ( $total_cost * 100 ) + 0.5 );
++        return {
++            success    => 0,
++            error      => 'PRINT_COST_CHANGED',
++            amount_due => sprintf( '%.2f', $total_cost ),
++        } unless $expected_cents == $current_cents;
++    }
++
+     $user->discard_changes; # Let's make absolutely sure we have the correct funds
+ 
+-    if ( $total_cost <= $user->funds ) {
+-        $user->debit_funds( $c, $total_cost ) if $total_cost;
++    return { success => 0, error => 'Insufficient funds' }
++        if $payment_method eq 'account' && $total_cost > $user->funds;
+ 
+-        $user->gratis_print_balance( $user->gratis_print_balance - $gratis_discount );
++    # Claim the held job with a single conditional UPDATE. The earlier status
++    # check gives the caller a useful response; this compare-and-swap is what
++    # prevents simultaneous requests from both charging/submitting the job.
++    my $claimed = $c->model('DB::PrintJob')->search(
++        {
++            id       => $print_job_id,
++            instance => $instance,
++            status   => PRINT_STATUS_HELD,
++        }
++    )->update(
++        {
++            status     => PRINT_STATUS_IN_PROGRESS,
++            copies     => $copies,
++            updated_on => $c->now,
++        }
++    );
+ 
+-        $print_job->status(PRINT_STATUS_PENDING);
++    return {
++        success => 0,
++        error   => 'Print Job Is Not Held',
++        id      => $print_job_id,
++    } unless $claimed && $claimed == 1;
+ 
++    $print_job->status(PRINT_STATUS_IN_PROGRESS);
++    $print_job->copies($copies);
++
++    my $gratis_balance_before = $user->gratis_print_balance;
++    my $accounting_error;
++
++    try {
+         $c->model('DB')->txn_do(
+             sub {
++                if ( $payment_method eq 'account' ) {
++                    $user->debit_funds(
++                        $c,
++                        $total_cost,
++                        provider => 'internal',
++                        notes    => "Print job $print_job_id release",
++                    ) if $total_cost;
++                }
++                else {
++                    $c->model('DB::Statistic')->create(
++                        {
++                            instance   => $c->instance,
++                            username   => $release_actor,
++                            action     => 'PRINT_PAYMENT_CASH',
++                            created_on => $c->now,
++                            session_id => $c->sessionid // '',
++                            info       => to_json(
++                                {
++                                    print_job_id => $print_job->id,
++                                    user_id      => $user->id,
++                                    amount       => sprintf( '%.2f', $total_cost ),
++                                }
++                            ),
++                        }
++                    );
++                }
++
++                $user->gratis_print_balance(
++                    $gratis_balance_before - $gratis_discount
++                );
++
+                 $user->update();
+-                $print_job->update();
+ 
+-                # Add statistic indicating gratis discount was used
++                die "Unable to mark print job $print_job_id pending"
++                    unless $print_job->update(
++                        {
++                            status      => PRINT_STATUS_PENDING,
++                            released_on => $c->now,
++                            updated_on  => $c->now,
++                        }
++                    );
++
+                 if ( $gratis_discount > 0 ) {
+                     $c->model('DB::Statistic')->create(
+                         {
+@@ -413,19 +979,153 @@ sub release {
+                         }
+                     );
+                 }
++
++                # PrintManager has no external side effect at release time:
++                # the accounting, Pending status, and audit statistic can be
++                # committed atomically before the manager polls for the job.
++                if ( $print_job->type eq 'PrintManager' ) {
++                    $c->model('DB::Statistic')->create(
++                        {
++                            instance   => $c->instance,
++                            username   => $c->user ? $c->user->username : '',
++                            action     => 'PRINT_JOB_RELEASED',
++                            created_on => $c->now,
++                            session_id => $c->sessionid // '',
++                            info       => to_json(
++                                {
++                                    print_job_id => $print_job->id,
++                                }
++                            ),
++                        }
++                    );
++                }
+             }
+         );
+     }
+-    else {
+-        return { success => 0, error => 'Insufficient funds' };
++    catch {
++        $accounting_error = $_;
++    };
++
++    if ($accounting_error) {
++        $log->error(
++            "Unable to account for print job $print_job_id release: $accounting_error"
++        );
++
++        # The transaction failed before any print backend was called. Restore
++        # only our own claim; a changed status means another actor intervened.
++        $c->model('DB::PrintJob')->search(
++            {
++                id       => $print_job_id,
++                instance => $instance,
++                status   => PRINT_STATUS_IN_PROGRESS,
++            }
++        )->update(
++            {
++                status     => PRINT_STATUS_HELD,
++                updated_on => $c->now,
++            }
++        );
++
++        return {
++            success => 0,
++            error   => 'Unable to account for print release',
++            id      => $print_job_id,
++        };
+     }
+ 
+-    if ( $print_job->type eq 'cups' ) {
+-        return release_for_cups( $c, $data );
++    return { success => 1, message => 'Ok' }
++        if $print_job->type eq 'PrintManager';
++
++    my $result = release_for_cups( $c, $data );
++    return $result if $result->{success};
++
++    # A CUPS failure before an accepted job is safe to compensate and retry.
++    # If submission may have happened, leave the job non-Held and charged so a
++    # staff retry cannot create a duplicate physical print.
++    return $result unless $result->{safe_to_retry};
++
++    my $compensation_error;
++    try {
++        $c->model('DB')->txn_do(
++            sub {
++                if ( $payment_method eq 'account' ) {
++                    $user->credit_funds(
++                        $c,
++                        $total_cost,
++                        provider => 'internal',
++                        notes    => "Automatic refund for failed print job $print_job_id release",
++                    ) if $total_cost;
++                }
++                else {
++                    $c->model('DB::Statistic')->create(
++                        {
++                            instance   => $c->instance,
++                            username   => $release_actor,
++                            action     => 'PRINT_PAYMENT_CASH_VOID',
++                            created_on => $c->now,
++                            session_id => $c->sessionid // '',
++                            info       => to_json(
++                                {
++                                    print_job_id => $print_job->id,
++                                    amount       => sprintf( '%.2f', $total_cost ),
++                                }
++                            ),
++                        }
++                    );
++                }
++
++                $user->gratis_print_balance($gratis_balance_before);
++                $user->update();
++
++                my $restored = $c->model('DB::PrintJob')->search(
++                    {
++                        id       => $print_job_id,
++                        instance => $instance,
++                        status   => PRINT_STATUS_PENDING,
++                    }
++                )->update(
++                    {
++                        status      => PRINT_STATUS_HELD,
++                        released_on => undef,
++                        updated_on  => $c->now,
++                    }
++                );
++
++                die "Unable to restore failed print job $print_job_id to Held"
++                    unless $restored && $restored == 1;
++
++                $c->model('DB::Statistic')->create(
++                    {
++                        instance   => $c->instance,
++                        username   => $c->user ? $c->user->username : '',
++                        action     => 'PRINT_JOB_RELEASE_FAILED',
++                        created_on => $c->now,
++                        session_id => $c->sessionid // '',
++                        info       => to_json(
++                            {
++                                print_job_id => $print_job->id,
++                                refunded     => $total_cost,
++                            }
++                        ),
++                    }
++                );
++            }
++        );
+     }
+-    elsif ( $print_job->type eq 'PrintManager' ) {
+-        return release_for_print_manager( $c, $data );
++    catch {
++        $compensation_error = $_;
++    };
++
++    if ($compensation_error) {
++        $log->error(
++            "Automatic compensation failed for print job $print_job_id: $compensation_error"
++        );
++        $result->{manual_review} = 1;
++        $result->{safe_to_retry} = 0;
++        $result->{error} = 'Print release failed; automatic refund requires review';
+     }
++
++    return $result;
+ }
+ 
+ =head2 release_for_print_manager
+@@ -476,47 +1176,163 @@ sub release_for_cups {
+     my $printer    = $params->{printer};
+ 
+     my $log  = $c->log();
+-    my $cups = cups_setup($c);
++    my ( $cups, $setup_error );
++    try {
++        $cups = cups_setup($c);
++    }
++    catch {
++        $setup_error = $_;
++    };
++
++    if ($setup_error) {
++        $log->error("Unable to initialize CUPS: $setup_error");
++        return {
++            success       => 0,
++            error         => 'Unable to initialize CUPS',
++            safe_to_retry => 1,
++        };
++    }
+ 
+     my $cups_printer_name = $printer->{name} || $printer->{physical_printer_name};
+     $log->debug( "CUPS Printer name: " . $cups_printer_name );
+-    my $cups_printer = $cups->getDestination($cups_printer_name);
++    my ( $cups_printer, $destination_error );
++    try {
++        $cups_printer = $cups->getDestination($cups_printer_name);
++    }
++    catch {
++        $destination_error = $_;
++    };
++
++    if ($destination_error) {
++        $log->error("Unable to query CUPS destination $cups_printer_name: $destination_error");
++        return {
++            success       => 0,
++            error         => 'Unable to query printer on CUPS server',
++            id            => $print_job->printer,
++            safe_to_retry => 1,
++        };
++    }
+ 
+     return {
+-        success => 0,
+-        error   => 'Printer Not Found on CUPS server',
+-        id      => $print_job->printer
++        success       => 0,
++        error         => 'Printer Not Found on CUPS server',
++        id            => $print_job->printer,
++        safe_to_retry => 1,
+         }
+         unless $cups_printer;
+ 
++    my $cups_options = cups_job_options( $print_job, $printer );
++    my $option_error;
++    try {
++        for my $name ( sort keys %{$cups_options} ) {
++            $cups_printer->addOption( $name, "$cups_options->{$name}" );
++        }
++    }
++    catch {
++        $option_error = $_;
++    };
++
++    if ($option_error) {
++        $log->error(
++            "Unable to apply authoritative CUPS options for print job "
++                . $print_job->id . ": $option_error"
++        );
++        return {
++            success       => 0,
++            error         => 'Unable to apply printer policy',
++            safe_to_retry => 1,
++        };
++    }
++
+ 
+     # In order to print to CUPS, the data must be on a file
+     # Create a temporary file to print
+-    my $cups_print_filename = cups_create_print_file( $c, $print_file->data );
++    my ( $cups_print_filename, $print_file_error );
++    try {
++        $cups_print_filename = cups_create_print_file( $c, $print_file->data );
++    }
++    catch {
++        $print_file_error = $_;
++    };
++
++    if ($print_file_error) {
++        $log->error("Unable to create temporary CUPS file: $print_file_error");
++        return {
++            success       => 0,
++            error         => 'Unable to prepare the print job for CUPS',
++            safe_to_retry => 1,
++        };
++    }
++
+     $log->debug( "Created temp file for CUPS printing: " . $cups_print_filename );
+ 
+-    # The job title is the original print file name
+-    my $cups_print_job_id = $cups_printer->printFile( $cups_print_filename, $print_file->filename );
++    # Include the immutable Libki job id so an uncertain submission can be
++    # reconciled in CUPS without exposing the patron's card number.
++    my $job_title = join q{-}, 'libki', $c->instance, $print_job->id, $print_file->filename;
++    my ( $cups_print_job_id, $submission_error );
++    try {
++        $cups_print_job_id = $cups_printer->printFile( $cups_print_filename, $job_title );
++    }
++    catch {
++        $submission_error = $_;
++    };
+     unlink($cups_print_filename);
+ 
++    if ($submission_error) {
++        $log->error(
++            "CUPS submission outcome is uncertain for print job " . $print_job->id . ": $submission_error"
++        );
++        return {
++            success       => 0,
++            error         => 'CUPS submission outcome requires staff review',
++            id            => $print_job->printer,
++            safe_to_retry => 0,
++            manual_review => 1,
++        };
++    }
++
+     return {
+-        success => 0,
+-        error   => 'Error printing on printer',
+-        id      => $print_job->printer
++        success       => 0,
++        error         => 'Error printing on printer',
++        id            => $print_job->printer,
++        safe_to_retry => 1,
+         }
+         unless $cups_print_job_id;
+ 
+ 
+-    my $cups_print_job_data  = $cups_printer->getJob($cups_print_job_id);
+-    my $cups_print_job_state = $cups_print_job_data->{state_text};
+-    $print_job->update(
++    my $cups_print_job_data;
++    try {
++        $cups_print_job_data = $cups_printer->getJob($cups_print_job_id);
++    };
++    $cups_print_job_data ||= { id => $cups_print_job_id };
++    $cups_print_job_data->{id} //= $cups_print_job_id;
++
++    # Libki's Done state means the physical backend accepted the job. Do not
++    # persist CUPS' transient "processing" state: this CUPS tier intentionally
++    # purges completed job history, so polling that state would leave the staff
++    # UI stuck forever after the job disappears from CUPS.
++    my $updated = $print_job->update(
+         {
+             data       => $cups_print_job_data,
+-            status     => $cups_print_job_state,
++            status     => PRINT_STATUS_DONE,
++            queued_on  => $c->now(),
++            queued_to  => $cups_printer_name,
+             updated_on => $c->now(),
+         }
+     );
+ 
++    unless ($updated) {
++        $log->error(
++            "CUPS accepted print job $cups_print_job_id but Libki job " . $print_job->id . " could not be updated"
++        );
++        return {
++            success       => 0,
++            error         => 'CUPS accepted the job but Libki requires staff review',
++            safe_to_retry => 0,
++            manual_review => 1,
++        };
++    }
++
+     $c->model('DB::Statistic')->create(
+         {
+             instance   => $c->instance,
+@@ -526,7 +1342,7 @@ sub release_for_cups {
+             session_id => $c->sessionid // '',
+             info       => to_json(
+                 {
+-                    print_job_id    => $print_job->id,
++                    print_job_id => $print_job->id,
+                 }
+             ),
+         }
+diff --git a/root/dynamic/templates/administration/index.tt b/root/dynamic/templates/administration/index.tt
+index 40aeca1..979b820 100644
+--- a/root/dynamic/templates/administration/index.tt
++++ b/root/dynamic/templates/administration/index.tt
+@@ -274,7 +274,7 @@
+ 
+         <table id="print-table" cellpadding="0" cellspacing="0" border="0" class="table table-striped table-bordered">
+             <thead>
+-                <th>[% c.loc("Type") %]</th>
++                <th>[% c.loc("Select") %]</th>
+                 <th>[% c.loc("Status") %]</th>
+                 <th>[% c.loc("Printer") %]</th>
+                 <th>[% c.loc("Copies") %]</th>
+@@ -292,7 +292,7 @@
+                     id="print-table-row-toolbar-release"
+                     class="btn libki-toolbar-btn btn-outline-primary"
+                 >
+-                    <i class="fas fa-print"></i> [% c.loc("Print") %]
++                    <i class="fas fa-print"></i> [% c.loc("Reprint") %]
+                 </button>
+ 
+                 <button
+@@ -1165,6 +1165,13 @@ $(document).ready(function() {
+          },
+      } );
+ 
++    const selectedPrintJobs = new Set();
++    let printQueueView = 'pending';
++    function updatePrintSelection() {
++        const count = selectedPrintJobs.size;
++        $('#print-selected-button').text('Print selected ('+count+')')
++            .prop('disabled', !count || !!$('#staff-print-review').length);
++    }
+     // Initalize the Print table as a datatable
+     const pTable = $('#print-table').DataTable( {
+         [% IF !c.language.match('en') %]"language": { "url": "https://cdn.datatables.net/plug-ins/9dcbecd42ad/i18n/[% c.installed_languages.${c.language} %].json" },[% END %]
+@@ -1175,20 +1182,36 @@ $(document).ready(function() {
+                 data.location_filter = window.location_filter;
+             }
+ 
++            data.queue_view = printQueueView;
+             $.getJSON("[% c.uri_for('/administration/api/datatables/prints') %]", data, function (json) {
++                // Never retain invisible or no-longer-held jobs after a filter,
++                // page change or refresh. Review snapshots are separately quoted.
++                const held = new Set(json.data.filter(row => row[1] === 'Held').map(row => String(row.DT_RowId)));
++                selectedPrintJobs.forEach(id => { if (!held.has(id)) selectedPrintJobs.delete(id); });
+                 callback(json);
++                updatePrintSelection();
+             } );
+         },
+-        columnDefs: [
+-            { targets: [4], className: 'truncate-cell' }
+-        ],
+-        "order": [[ 7, "desc" ]],
++        "order": [[ 8, "desc" ]],
++        "columnDefs": [{targets:0, orderable:false, searchable:false}],
+         "drawCallback": function(oSettings, json) {
+             AddTableRowToolbar( $('#print-table-row-toolbar'), $('#print-table'), $('#print-table tbody tr') );
++            $('#print-table-row-toolbar-release').prop('hidden',true);
+         },
+         "rowCallback": function(nRow, aData, iDisplayIndex, iDisplayIndexFull) {
+-            // Type column
+-            $('td:eq(0)', nRow).html(aData[0].replace('PrintManager', `[% c.loc("Print Manager") %]`));
++            // Staff select documents, not the underlying print backend.
++            $('td:eq(0)', nRow).empty();
++            if (aData[1] === 'Held') {
++                const box = $('<input type="checkbox" class="print-select" aria-label="Select print job">')
++                    .attr('data-print-id', aData.DT_RowId)
++                    .attr('aria-label', 'Select document '+aData[4]+' (job '+aData.DT_RowId+')')
++                    .prop('checked', selectedPrintJobs.has(String(aData.DT_RowId)));
++                $('td:eq(0)', nRow).append(box);
++            }
++            $(nRow).off('mouseenter.staffPrint').on('mouseenter.staffPrint',function() {
++                $('#print-table-row-toolbar-release').prop('hidden',aData[1] !== 'Done');
++            });
++
+ 
+             // Status column
+             $('td:eq(1)', nRow).html(aData[1].replace('In_progress', `[% c.loc("In progress") %]`));
+@@ -1205,7 +1228,16 @@ $(document).ready(function() {
+             }
+         },
+         "initComplete": function(){
+-            $('#print-table-toolbar').prependTo($('#print-table_filter'));
++            // DataTables 2 uses .dt-search; retain the legacy fallback.
++            const filter = $('#print-table_wrapper .dt-search, #print-table_filter').first();
++            $('#print-table-toolbar').prependTo(filter);
++            const queue = $('<select class="form-control" aria-label="Print queue view"><option value="pending">Pending jobs</option><option value="all">All jobs / reprint history</option></select>');
++            queue.on('change', function() { printQueueView = this.value; selectedPrintJobs.clear(); updatePrintSelection(); pTable.ajax.reload(); });
++            const batch = $('<button type="button" id="print-selected-button" class="btn btn-primary" disabled>Print selected (0)</button>');
++            batch.on('click', function() { openPrintReview(Array.from(selectedPrintJobs), true); });
++            filter.append(queue, batch, $('<small class="d-block text-muted">Select up to 20 held documents on this page, then review copies and the total.</small>'));
++            updatePrintSelection();
++
+         }
+     } );
+ 
+@@ -1957,16 +1989,134 @@ $(document).ready(function() {
+ 
+ /*********** Prints Table  ***********/
+ 
+-    /* Release Print Job */
+-    $('#print-table-row-toolbar-release').click(function() {
+-      $.getJSON('[% c.uri_for("api/printjob/release") %]', { id: window.selected_id }, function(data) {
+-        if ( data.success ) {
+-          DisplayMessage( "success", data.message );
+-          ForcePrintTableRefresh();
+-        } else {
+-            DisplayMessage( "error", "[% c.loc("Failed to release print job: ") %]" + data.error );
++    $('#print-table').on('click', '.print-select', function(event) {
++      event.stopPropagation();
++      const id = String($(this).attr('data-print-id'));
++      if (this.checked && selectedPrintJobs.size >= 20 && !selectedPrintJobs.has(id)) {
++        this.checked=false; DisplayMessage('error','Select up to 20 documents at a time.'); return;
++      }
++      if (this.checked) selectedPrintJobs.add(id); else selectedPrintJobs.delete(id);
++      updatePrintSelection();
++    });
++
++    function printPreview(id, copies) {
++      return $.ajax({url:'[% c.uri_for("api/printjob/preview") %]',method:'GET',dataType:'json',timeout:15000,data:{id:id,copies:copies}});
++    }
++    function openPrintReview(ids, batch) {
++      ids = Array.from(new Set(ids.map(String)));
++      if (!ids.length) { DisplayMessage('error','Select a print job first.'); return; }
++      if (ids.length > 20) { DisplayMessage('error','Release up to 20 jobs at a time.'); return; }
++      if ($('#staff-print-review').length) return;
++      const modal = $('<div class="modal" id="staff-print-review" tabindex="-1" role="dialog" aria-label="Review print jobs"><div class="modal-dialog modal-xl" style="max-width:1100px"><div class="modal-content"><div class="modal-header"><h4 class="modal-title">Review selected documents</h4></div><div class="modal-body"><p>Check each document, printer and copy count before collecting cash. Copies is the final quantity, not an additional multiplier.</p><div class="table-responsive"><table class="table table-bordered"><thead><tr><th scope="col">Document</th><th scope="col">Printer</th><th scope="col">Pages per copy</th><th scope="col">Copies</th><th scope="col">Cost</th></tr></thead><tbody class="print-review-jobs"></tbody></table></div><p class="print-total" role="status" aria-live="polite" style="font-size:1.4rem;font-weight:700"></p><p class="print-sign-in" hidden><a href="[% c.uri_for('/administration') %]">Sign in again to review this job</a>. No job has been released.</p><label><input type="checkbox" class="print-cash" disabled> <span class="print-cash-label">Cash confirmation unavailable until pricing is loaded</span></label><div class="print-results" role="status" aria-live="polite"></div></div><div class="modal-footer"><button type="button" class="btn btn-default print-close">Cancel</button><button type="button" class="btn btn-primary print-submit" disabled>Print selected documents</button></div></div></div></div>');
++      $('body').append(modal);
++      $('#print-selected-button').prop('disabled',true);
++      const jobs = [];
++      let busy = false;
++      let finished = false;
++      function totals() {
++        const ready = jobs.length === ids.length && jobs.every(j => j.ready);
++        const failed = jobs.some(j => j.error);
++        const cents = jobs.reduce((n,j) => n + Math.round(Number(j.preview?.amount_due || 0)*100),0);
++        const pages = jobs.reduce((n,j) => n + Number(j.preview?.total_pages || 0),0);
++        const amount = '$'+(cents/100).toFixed(2);
++        const reprint = jobs.some(j => j.preview?.action_mode === 'reprint');
++        const chargeLabel = reprint ? 'Additional reprint charge to collect: ' : 'Total to collect: ';
++        modal.find('.print-submit').text(reprint ? 'Reprint document' : 'Print selected documents');
++        modal.find('.print-total').text(ready ? chargeLabel+amount+' | '+jobs.length+' document(s) | Total printed pages: '+pages :
++          (failed ? 'Total unavailable. Do not collect cash or release this job.' : 'Checking quantities and pricing...'));
++        modal.find('.print-cash').prop('disabled', busy || !ready);
++        if (!ready) modal.find('.print-cash').prop('checked',false);
++        modal.find('.print-cash-label').text(ready ? 'Cash collected: '+amount : 'Cash confirmation unavailable until pricing is loaded');
++        modal.find('.print-submit').prop('disabled', busy || !ready || !modal.find('.print-cash').prop('checked'));
++      }
++      function quote(job, initial) {
++        job.ready = false; job.error = false;
++        job.row.find('.print-line-total').text('--');
++        modal.find('.print-cash').prop('checked',false);
++        const version = ++job.version;
++        const copies = initial ? undefined : job.input.val();
++        job.summary.text('Checking price...');
++        totals();
++        if (!initial && (!/^[0-9]{1,2}$/.test(copies) || Number(copies)<1 || Number(copies)>99)) {
++          job.error = true; job.summary.text('Enter 1-99 copies.'); totals(); return;
++        }
++        printPreview(job.id,copies).done(function(data) {
++          if (version !== job.version) return;
++          if (!data.success || !['release','reprint'].includes(data.action_mode) || (batch && data.action_mode !== 'release') ||
++              data.amount_due == null || data.amount_due === '' || !Number.isFinite(Number(data.amount_due)) || Number(data.amount_due)<0 ||
++              !Number.isInteger(Number(data.copies)) || Number(data.copies)<1 || Number(data.copies)>99 ||
++              !Number.isInteger(Number(data.pages)) || Number(data.pages)<1 || Number(data.total_pages)!==Number(data.pages)*Number(data.copies) ||
++              (!initial && Number(data.copies)!==Number(copies))) {
++            job.error = true; job.summary.text(data.error || 'Job is no longer held or available.'); totals(); return;
++          }
++          job.preview=data; job.ready=true;
++          if (initial) job.input.val(data.copies);
++          job.row.find('.print-file').text((data.action_mode==='reprint'?'Reprint: ':'')+data.filename);
++          job.row.find('.print-patron').text((data.identifier_label || 'Patron')+': '+data.library_card+' | Job '+job.id);
++          job.row.find('.print-printer').text(data.printer_name);
++          job.row.find('.print-pages').text(data.pages);
++          job.row.find('.print-line-total').text('$'+Number(data.amount_due).toFixed(2));
++          job.input.attr('aria-label','Copies for '+data.filename+' (job '+job.id+')');
++          job.summary.text(data.pages+' pages per copy x '+data.copies+' copies = '+data.total_pages+' printed pages | $'+Number(data.amount_due).toFixed(2));
++          totals();
++        }).fail(function(xhr) {
++          if(version!==job.version) return;
++          job.error=true;
++          const signedOut = xhr.status===401;
++          job.summary.text(signedOut ? 'Your staff session has ended. Sign in again to load pricing.' :
++            'Unable to load pricing. Refresh this page and sign in again if asked.');
++          modal.find('.print-sign-in').prop('hidden',false);
++          totals();
++        });
++      }
++      modal.find('.print-close').on('click',function(){ if(!busy) modal.modal('hide'); });
++      modal.on('hide.bs.modal',function(event){ if(busy) event.preventDefault(); });
++      modal.on('hidden.bs.modal',function(){ modal.remove(); $('#print-selected-button').prop('disabled',!selectedPrintJobs.size); });
++      modal.find('.print-cash').on('change',totals);
++      modal.modal({backdrop:'static',keyboard:false});
++      ids.forEach(function(id) {
++        const row=$('<tr><td><strong class="print-file">Loading document...</strong><small class="print-patron d-block"></small><small class="print-summary d-block" role="status" aria-live="polite"></small></td><td class="print-printer"></td><td class="print-pages"></td><td><input type="number" aria-label="Copies" min="1" max="99" step="1" value="1" class="form-control print-copies" style="min-width:80px;max-width:100px"></td><td class="print-line-total" style="white-space:nowrap">--</td></tr>');
++        modal.find('.print-review-jobs').append(row);
++        const job={id:id,ready:false,error:false,version:0,row:row,input:row.find('.print-copies'),summary:row.find('.print-summary'),requestId:crypto.randomUUID()};
++        jobs.push(job);
++        quote(job,true);
++        job.input.on('input',function(){quote(job,false);});
++      });
++      modal.find('.print-submit').on('click',async function() {
++        if(busy || finished || jobs.length!==ids.length || !jobs.every(j=>j.ready) || !modal.find('.print-cash').prop('checked')) return;
++        busy=true;totals();modal.find('input').prop('disabled',true);modal.find('.print-close').prop('disabled',true);
++        const results=modal.find('.print-results').empty();
++        let sessionEnded=false;
++        for (const job of jobs) {
++          const description=job.preview.filename+' (job '+job.id+', '+job.preview.printer_name+', '+job.preview.copies+' copies, $'+Number(job.preview.amount_due).toFixed(2)+'): ';
++          if(sessionEnded) {
++            $('<p>').text(description+'NOT attempted - staff session ended.').appendTo(results); continue;
++          }
++          const endpoint=job.preview.action_mode==='reprint'?'[% c.uri_for("api/printjob/reprint") %]':'[% c.uri_for("api/printjob/release") %]';
++          try {
++            const result=await $.ajax({url:endpoint,method:'POST',dataType:'json',timeout:30000,headers:{'X-Requested-With':'XMLHttpRequest'},
++              data:{id:job.id,copies:job.preview.copies,cash_received:'1',expected_amount:job.preview.amount_due,request_id:job.requestId}});
++            const outcome=result.success ? 'Accepted by print system.' :
++              (result.manual_review || result.safe_to_retry===0 || result.safe_to_retry===false ? 'STATUS UNCERTAIN - check job status before retrying. ' : 'NOT released - ')+(result.error||'Unknown error');
++            $('<p>').text(description+outcome).appendTo(results);
++          } catch(error) {
++            sessionEnded=error.status===401;
++            $('<p>').text(description+(sessionEnded ? 'Staff session ended. ' : 'Request failed. ')+'Check job status before trying again; do not assume it did not print.').appendTo(results);
++          }
+         }
++        selectedPrintJobs.clear();ForcePrintTableRefresh();
++        busy=false;finished=true;
++        modal.find('.print-submit').prop('disabled',true).hide();
++        modal.find('.print-total').text('Submission finished. Review each result below; reconcile collected cash for any unreleased or uncertain jobs.');
++        modal.find('.print-close').prop('disabled',false).text('Close');
++        modal.find('.print-cash').closest('label').hide();
+       });
++    }
++    $('#print-table-row-toolbar-release').click(function(event) {
++      event.preventDefault();
++      // Historical completed jobs retain a separate, explicitly named Reprint.
++      const row=pTable.rows().data().toArray().find(row => String(row.DT_RowId)===String(window.selected_id));
++      if(row && row[1]==='Done') openPrintReview([String(window.selected_id)],false);
+     });
+ 
+     /* Refresh Print Job */
+diff --git a/t/printing_acceptance.t b/t/printing_acceptance.t
+new file mode 100644
+index 0000000..32fb4e7
+--- /dev/null
++++ b/t/printing_acceptance.t
+@@ -0,0 +1,1159 @@
++use Modern::Perl;
++use Test::More;
++use Test::MockObject;
++
++use JSON qw(to_json);
++
++use Libki::Utils::Printing;
++
++# Helper to build a mock $c context object
++sub build_mock_c {
++    my (%opts) = @_;
++
++    my $gratis_method = $opts{gratis_method} // '';
++
++    # Mock log object
++    my $log = Test::MockObject->new();
++    $log->mock( 'info',  sub { } );
++    $log->mock( 'debug', sub { } );
++    $log->mock( 'error', sub { } );
++
++    # Track statistics created
++    my @created_statistics;
++    my $stat_rs = Test::MockObject->new();
++    $stat_rs->mock( 'create', sub { shift; push @created_statistics, shift; return 1; } );
++    $stat_rs->mock('search', sub {
++        my $rs = Test::MockObject->new();
++        $rs->mock('all', sub { return map { my $h=$_; my $o=Test::MockObject->new(); $o->mock('info',sub{$h->{info}}); $o; } @created_statistics; });
++        return $rs;
++    });
++
++    # Mock DB model (for txn_do — just runs the sub immediately)
++    my $db_model = Test::MockObject->new();
++    $db_model->mock( 'txn_do', sub { my ( $self, $code ) = @_; $code->(); } );
++
++    # Mock print job result set
++    my @created_print_jobs;
++    my $print_job_rs = Test::MockObject->new();
++    $print_job_rs->mock( 'find', sub {
++        my ($self,$where)=@_;
++        return $opts{created_print_job} if $opts{created_print_job} && $where->{id} == $opts{created_print_job}->id;
++        return $opts{print_job};
++    });
++
++    $print_job_rs->mock( 'search', sub {
++        my ( $self, $where ) = @_;
++        my $claim_rs = Test::MockObject->new();
++        $claim_rs->mock('single',sub{$opts{print_job}});
++        $claim_rs->mock( 'update', sub {
++            my ( $claim_self, $changes ) = @_;
++            return 0 if $opts{claim_fails};
++
++            my $job = $opts{print_job};
++            return 0 unless $job;
++            return 0 if exists $where->{id} && $where->{id} != $job->id;
++            return 0 if exists $where->{status} && $where->{status} ne $job->status;
++
++            $job->copies( $changes->{copies} ) if exists $changes->{copies};
++            $job->status( $changes->{status} ) if exists $changes->{status};
++            return 1;
++        });
++        return $claim_rs;
++    });
++    $print_job_rs->mock( 'create', sub {
++        my ( $self, $values ) = @_;
++        push @created_print_jobs, $values;
++        return $opts{created_print_job};
++    });
++
++    # Mock print file result set
++    my $print_file_rs = Test::MockObject->new();
++    $print_file_rs->mock( 'find', sub {
++        return $opts{print_file};
++    });
++
++    # Printer configuration
++    my $printer_config = $opts{printer_config} // {
++        printers => {}
++    };
++
++    # Mock user object for $c->user (used inside calculate_job_cost and txn_do block)
++    my $c_user = $opts{c_user} // $opts{user};
++
++    my $c = Test::MockObject->new();
++    $c->mock( 'instance',  sub { return 'TEST'; } );
++    $c->mock( 'log',       sub { return $log; } );
++    $c->mock( 'now',       sub { return '2026-02-13 12:00:00'; } );
++    $c->mock( 'sessionid', sub { return 'test-session-id'; } );
++    $c->mock( 'user',      sub { return $c_user; } );
++    $c->mock( 'get_printer_configuration', sub { return $printer_config; } );
++    $c->mock( 'setting', sub {
++        my ( $self, $name ) = @_;
++        if ( $name eq 'GratisPrintingMethod' ) {
++            return $gratis_method;
++        }
++        return '';
++    });
++    $c->mock( 'check_user_roles', sub {
++        my ( $self, $role ) = @_;
++        return $opts{is_admin} // 0;
++    });
++    $c->mock( 'model', sub {
++        my ( $self, $model_name ) = @_;
++        return $print_job_rs   if $model_name eq 'DB::PrintJob';
++        return $print_file_rs  if $model_name eq 'DB::PrintFile';
++        return $stat_rs        if $model_name eq 'DB::Statistic';
++        return $db_model       if $model_name eq 'DB';
++        return undef;
++    });
++
++    return ( $c, \@created_statistics, \@created_print_jobs );
++}
++
++# Helper to build a mock user object
++sub build_mock_user {
++    my (%opts) = @_;
++
++    my $_funds                = $opts{funds}                // 10.00;
++    my $_gratis_print_balance = $opts{gratis_print_balance} // 0;
++    my $_id                   = $opts{id}                   // 1;
++    my $_username             = $opts{username}              // 'testuser';
++    my $_firstname            = $opts{firstname}             // 'Test';
++    my $_lastname             = $opts{lastname}              // 'Patron';
++    my $_debit_called         = 0;
++    my $_debit_amount         = 0;
++
++    my $_credit_called        = 0;
++    my $_credit_amount        = 0;
++    my $user = Test::MockObject->new();
++    $user->mock( 'id',       sub { return $_id; } );
++    $user->mock( 'username', sub { return $_username; } );
++    $user->mock( 'firstname', sub { return $_firstname; } );
++    $user->mock( 'lastname',  sub { return $_lastname; } );
++    $user->mock( 'funds',    sub { return $_funds; } );
++    $user->mock( 'gratis_print_balance', sub {
++        my ( $self, $val ) = @_;
++        if ( @_ > 1 && defined $val ) {
++            $_gratis_print_balance = $val;
++            return $self;
++        }
++        return $_gratis_print_balance;
++    });
++    $user->mock( 'debit_funds', sub {
++        my ( $self, $c, $amount ) = @_;
++        $_debit_called++;
++        $_debit_amount = $amount;
++        $_funds -= $amount;
++        return 1;
++    });
++    $user->mock( 'credit_funds', sub {
++        my ( $self, $c, $amount ) = @_;
++        $_credit_called++;
++        $_credit_amount = $amount;
++        $_funds += $amount;
++        return 1;
++    });
++    $user->mock( 'discard_changes', sub { return; } );
++    $user->mock( 'update', sub { return 1; } );
++
++    return ( $user, \$_debit_called, \$_debit_amount, \$_gratis_print_balance,
++        \$_credit_called, \$_credit_amount, \$_funds );
++}
++
++# Helper to build a mock print job
++sub build_mock_print_job {
++    my (%opts) = @_;
++
++    my $_copies = $opts{copies} // 1;
++    my $_printer = $opts{printer}  // 'printer1';
++    my $_status  = $opts{status}   // 'Held';
++    my $_type    = $opts{type}     // 'PrintManager';
++    my $_update_called = 0;
++    my %_last_update;
++
++    my $pj = Test::MockObject->new();
++    $pj->mock( 'id',            sub { return $opts{id} // 1; } );
++    $pj->mock( 'data',          sub { return undef; } );
++    $pj->mock( 'user_id',       sub { return $opts{user_id} // 1; } );
++    $pj->mock( 'print_file_id', sub { return $opts{print_file_id} // 100; } );
++    $pj->mock( 'copies', sub { my ($self,$v)=@_; $_copies=$v if defined $v; return $_copies; } );
++    $pj->mock( 'type',          sub { return $_type; } );
++    $pj->mock( 'printer', sub {
++        my ( $self, $val ) = @_;
++        if ( @_ > 1 && defined $val ) {
++            $_printer = $val;
++            return $self;
++        }
++        return $_printer;
++    });
++    $pj->mock( 'status', sub {
++        my ( $self, $val ) = @_;
++        if ( @_ > 1 && defined $val ) {
++            $_status = $val;
++            return $self;
++        }
++        return $_status;
++    });
++    $pj->mock( 'update', sub {
++        my ( $self, $args ) = @_;
++        $_update_called = 1;
++        if ( ref $args eq 'HASH' ) {
++            %_last_update = %{$args};
++            $_status = $args->{status} if exists $args->{status};
++        }
++        return 1;
++    });
++    $pj->mock( 'discard_changes', sub { return; } );
++    $pj->mock( 'print_file', sub { return $opts{print_file}; } );
++    $pj->mock( 'user',       sub { return $opts{user_obj}; } );
++
++    return ( $pj, \$_status, \$_update_called, \%_last_update );
++}
++
++# Helper to build a mock print file
++sub build_mock_print_file {
++    my (%opts) = @_;
++    my $pf = Test::MockObject->new();
++    $pf->mock( 'id',       sub { return $opts{id}       // 100; } );
++    $pf->mock( 'pages',    sub { return $opts{pages}    // 5; } );
++    $pf->mock( 'filename', sub { return $opts{filename} // 'test.pdf'; } );
++    $pf->mock( 'client_name', sub { return $opts{client_name} // 'SAMPLE-PC-01'; } );
++    $pf->mock( 'client_location', sub { return $opts{client_location} // 'CPL Main'; } );
++    $pf->mock( 'data',     sub { return 'fake-pdf-data'; } );
++    return $pf;
++}
++
++
++# ========================================================================
++# Tests
++# ========================================================================
++
++subtest 'User does not match print job' => sub {
++    my ( $user ) = build_mock_user( id => 99 );  # user id 99
++
++    my $print_file = build_mock_print_file();
++    my ( $print_job ) = build_mock_print_job(
++        user_id    => 1,  # job belongs to user 1
++        print_file => $print_file,
++    );
++
++    my ( $c ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => { printers => { printer1 => { cost_per_page => 0.10, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 0, 'Should fail' );
++    is( $result->{error}, 'User does not match', 'Error message is correct' );
++};
++
++subtest 'Print job not found is handled before printer lookup' => sub {
++    my ( $user ) = build_mock_user();
++
++    my ( $c ) = build_mock_c(
++        user       => $user,
++        print_job  => undef,
++        print_file => undef,
++        printer_config => { printers => {} },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 404,
++        user         => $user,
++    });
++
++    is( $result->{success}, 0, 'Missing job fails safely' );
++    is( $result->{error}, 'Print Job Not Found', 'Error message is correct' );
++    is( $result->{id}, 404, 'Missing job id is returned' );
++};
++
++subtest 'Non-admin without user param is rejected' => sub {
++    my ( $user ) = build_mock_user();
++    my $print_file = build_mock_print_file();
++    my ( $print_job ) = build_mock_print_job(
++        user_obj   => $user,
++        print_file => $print_file,
++    );
++
++    my ( $c ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        is_admin   => 0,
++        printer_config => { printers => { printer1 => { cost_per_page => 0.10, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => undef,  # no user passed
++    });
++
++    is( $result->{success}, 0, 'Should fail' );
++    like( $result->{error}, qr/does not have rights/, 'Error message about rights' );
++};
++
++subtest 'Non-held print job is rejected before charging' => sub {
++    my ( $user, $debit_called ) = build_mock_user( funds => 10.00 );
++    my $print_file = build_mock_print_file();
++    my ( $print_job ) = build_mock_print_job(
++        status     => 'Pending',
++        user_obj   => $user,
++        print_file => $print_file,
++    );
++
++    my ( $c, $stats ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => { printers => { printer1 => { cost_per_page => 0.10, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 0, 'Non-held job fails' );
++    is( $result->{error}, 'Print Job Is Not Held', 'Failure is explicit' );
++    is( $$debit_called, 0, 'Patron was not charged' );
++    is( scalar @$stats, 0, 'No release statistic was recorded' );
++};
++
++subtest 'Lost atomic claim is rejected before charging' => sub {
++    my ( $user, $debit_called ) = build_mock_user( funds => 10.00 );
++    my $print_file = build_mock_print_file();
++    my ( $print_job ) = build_mock_print_job( user_obj => $user, print_file => $print_file );
++
++    my ( $c, $stats ) = build_mock_c(
++        user        => $user,
++        print_job   => $print_job,
++        print_file  => $print_file,
++        claim_fails => 1,
++        printer_config => { printers => { printer1 => { cost_per_page => 0.10, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 0, 'Losing request fails' );
++    is( $result->{error}, 'Print Job Is Not Held', 'Race is reported as already claimed' );
++    is( $$debit_called, 0, 'Losing request did not charge the patron' );
++    is( scalar @$stats, 0, 'Losing request did not record a release' );
++};
++
++subtest 'Repeated release debits and records exactly once' => sub {
++    my ( $user, $debit_called, $debit_amount ) = build_mock_user( funds => 10.00 );
++    my $print_file = build_mock_print_file( pages => 5 );
++    my ( $print_job, $pj_status ) = build_mock_print_job( user_obj => $user, print_file => $print_file );
++
++    my ( $c, $stats ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => { printers => { printer1 => { cost_per_page => 0.10, type => 'PrintManager' } } },
++    );
++
++    my $first = Libki::Utils::Printing::release( $c, { print_job_id => 1, user => $user } );
++    my $second = Libki::Utils::Printing::release( $c, { print_job_id => 1, user => $user } );
++
++    is( $first->{success}, 1, 'First release succeeds' );
++    is( $second->{success}, 0, 'Repeated release fails' );
++    is( $second->{error}, 'Print Job Is Not Held', 'Repeated release is rejected by status' );
++    is( $$debit_called, 1, 'Patron was debited exactly once' );
++    is( $$debit_amount, 0.50, 'Only the intended charge was applied' );
++    is( $$pj_status, 'Pending', 'Job remains Pending after the rejected retry' );
++    is( scalar( grep { $_->{action} eq 'PRINT_JOB_RELEASED' } @$stats ), 1,
++        'Exactly one release statistic was recorded' );
++};
++
++subtest 'Print file not found' => sub {
++    my ( $user ) = build_mock_user();
++    my ( $print_job ) = build_mock_print_job();
++
++    my ( $c ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => undef,  # print file not found in DB
++        printer_config => { printers => { printer1 => { cost_per_page => 0.10, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 0, 'Should fail' );
++    is( $result->{error}, 'Print File Not Found', 'Error message is correct' );
++};
++
++subtest 'Printer not found in configuration' => sub {
++    my ( $user ) = build_mock_user();
++    my $print_file = build_mock_print_file();
++    my ( $print_job ) = build_mock_print_job(
++        printer    => 'nonexistent',
++        print_file => $print_file,
++    );
++
++    my ( $c ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => { printers => {} },  # no printers configured
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 0, 'Should fail' );
++    is( $result->{error}, 'Printer Not Found', 'Error message is correct' );
++};
++
++subtest 'Insufficient funds' => sub {
++    my ( $user ) = build_mock_user( funds => 0.01 );  # very low funds
++    my $print_file = build_mock_print_file( pages => 10 );
++    my ( $print_job ) = build_mock_print_job(
++        copies     => 2,  # 20 pages total
++        print_file => $print_file,
++    );
++
++    my ( $c ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => { printers => { printer1 => { cost_per_page => 1.00, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 0, 'Should fail' );
++    is( $result->{error}, 'Insufficient funds', 'Error message is correct' );
++};
++
++subtest 'Successful release with no gratis discount (PrintManager)' => sub {
++    my ( $user, $debit_called, $debit_amount ) = build_mock_user( funds => 10.00 );
++    my $print_file = build_mock_print_file( pages => 5 );
++    my ( $print_job, $pj_status ) = build_mock_print_job(
++        copies     => 1,
++        print_file => $print_file,
++        user_obj   => $user,
++    );
++
++    my ( $c, $stats ) = build_mock_c(
++        user          => $user,
++        print_job     => $print_job,
++        print_file    => $print_file,
++        gratis_method => '',
++        printer_config => { printers => { printer1 => { cost_per_page => 0.10, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 1, 'Should succeed' );
++    is( $$debit_called, 1, 'debit_funds was called' );
++    is( $$debit_amount, 0.50, 'Debited correct amount (5 pages * $0.10)' );
++    is( $$pj_status, 'Pending', 'Print job status set to Pending' );
++    is( scalar @$stats, 1, 'One statistic created' );
++    is( $stats->[0]->{action}, 'PRINT_JOB_RELEASED', 'Statistic is PRINT_JOB_RELEASED' );
++};
++
++subtest 'Successful release with gratis discount - pages method (partial)' => sub {
++    my ( $user, $debit_called, $debit_amount, $gratis_bal )
++        = build_mock_user( funds => 10.00, gratis_print_balance => 3 );
++    my $print_file = build_mock_print_file( pages => 5 );
++    my ( $print_job, $pj_status ) = build_mock_print_job(
++        copies     => 1,
++        print_file => $print_file,
++        user_obj   => $user,
++    );
++
++    my ( $c, $stats ) = build_mock_c(
++        user          => $user,
++        print_job     => $print_job,
++        print_file    => $print_file,
++        gratis_method => 'pages',
++        printer_config => { printers => { printer1 => { cost_per_page => 0.10, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 1, 'Should succeed' );
++    # 5 pages - 3 gratis = 2 pages billable => 2 * 0.10 = 0.20
++    is( $$debit_amount, 0.20, 'Debited correct amount after gratis pages discount' );
++    is( scalar @$stats, 2, 'Two statistics created' );
++    is( $stats->[0]->{action}, 'GRATIS_DISCOUNT', 'First statistic is GRATIS_DISCOUNT' );
++    is( $stats->[1]->{action}, 'PRINT_JOB_RELEASED', 'Second statistic is PRINT_JOB_RELEASED' );
++};
++
++subtest 'Successful release with gratis discount - balance method' => sub {
++    my ( $user, $debit_called, $debit_amount, $gratis_bal )
++        = build_mock_user( funds => 10.00, gratis_print_balance => 0.30 );  # 30 cents gratis
++    my $print_file = build_mock_print_file( pages => 5 );
++    my ( $print_job, $pj_status ) = build_mock_print_job(
++        copies     => 1,
++        print_file => $print_file,
++        user_obj   => $user,
++    );
++
++    my ( $c, $stats ) = build_mock_c(
++        user          => $user,
++        print_job     => $print_job,
++        print_file    => $print_file,
++        gratis_method => 'funds',
++        printer_config => { printers => { printer1 => { cost_per_page => 0.10, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 1, 'Should succeed' );
++    # 5 pages * 0.10 = 0.50 cost, gratis balance 30, so cost = 0.20, discount = 0.30
++    is( $$debit_amount, 0.20, 'Debited correct amount after partial gratis balance discount' );
++    is( scalar @$stats, 2, 'Two statistics created' );
++    is( $stats->[0]->{action}, 'GRATIS_DISCOUNT', 'First statistic is GRATIS_DISCOUNT' );
++    is( $stats->[1]->{action}, 'PRINT_JOB_RELEASED', 'Second statistic is PRINT_JOB_RELEASED' );
++};
++
++subtest 'Successful release with gratis discount - pages method covers all pages' => sub {
++    my ( $user, $debit_called, $debit_amount, $gratis_bal )
++        = build_mock_user( funds => 10.00, gratis_print_balance => 10 );
++    my $print_file = build_mock_print_file( pages => 5 );
++    my ( $print_job, $pj_status ) = build_mock_print_job(
++        copies     => 1,
++        print_file => $print_file,
++        user_obj   => $user,
++    );
++
++    my ( $c, $stats ) = build_mock_c(
++        user          => $user,
++        print_job     => $print_job,
++        print_file    => $print_file,
++        gratis_method => 'pages',
++        printer_config => { printers => { printer1 => { cost_per_page => 0.10, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 1, 'Should succeed' );
++    # 5 pages, 10 gratis pages > 5 total, so all pages free, discount = 5
++    is( $$debit_amount, 0, 'Debited zero when gratis pages cover everything' );
++    is( scalar @$stats, 2, 'Two statistics created' );
++    is( $stats->[0]->{action}, 'GRATIS_DISCOUNT', 'First statistic is GRATIS_DISCOUNT' );
++    is( $stats->[1]->{action}, 'PRINT_JOB_RELEASED', 'Second statistic is PRINT_JOB_RELEASED' );
++};
++
++subtest 'Printer changed at release time' => sub {
++    my ( $user, $debit_called, $debit_amount ) = build_mock_user( funds => 10.00 );
++    my $print_file = build_mock_print_file( pages => 1 );
++    my ( $print_job, $pj_status, $pj_update_called ) = build_mock_print_job(
++        print_file => $print_file,
++        user_obj   => $user,
++    );
++
++    my ( $c, $stats ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => {
++            printers => {
++                printer1 => { cost_per_page => 0.10, type => 'PrintManager' },
++                printer2 => { cost_per_page => 0.25, type => 'PrintManager' },
++            }
++        },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++        printer      => 'printer2',
++    });
++
++    is( $result->{success}, 1, 'Should succeed' );
++    # Cost should use new printer: 1 page * $0.25 = $0.25
++    is( $$debit_amount, 0.25, 'Cost calculated using the new printer' );
++};
++
++subtest 'Zero cost job succeeds without debit issues' => sub {
++    my ( $user, $debit_called, $debit_amount ) = build_mock_user( funds => 0 );
++    my $print_file = build_mock_print_file( pages => 5 );
++    my ( $print_job ) = build_mock_print_job(
++        print_file => $print_file,
++        user_obj   => $user,
++    );
++
++    my ( $c ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => { printers => { printer1 => { cost_per_page => 0, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => $user,
++    });
++
++    is( $result->{success}, 1, 'Should succeed with zero cost' );
++    is( $$debit_amount, 0, 'Zero amount debited' );
++};
++
++subtest 'Admin can release without user param' => sub {
++    my ( $user ) = build_mock_user();
++    my $print_file = build_mock_print_file( pages => 1 );
++    my ( $print_job ) = build_mock_print_job(
++        user_obj   => $user,
++        print_file => $print_file,
++    );
++
++    my ( $c, $stats ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        is_admin   => 1,
++        printer_config => { printers => { printer1 => { cost_per_page => 0, type => 'PrintManager' } } },
++    );
++
++    my $result = Libki::Utils::Printing::release( $c, {
++        print_job_id => 1,
++        user         => undef,  # admin, no user passed
++    });
++
++    is( $result->{success}, 1, 'Admin release should succeed' );
++    is( scalar @$stats, 1, 'One statistic created' );
++    is( $stats->[0]->{action}, 'PRINT_JOB_RELEASED', 'Statistic is PRINT_JOB_RELEASED' );
++};
++subtest 'Known CUPS failure restores Held and refunds exactly once' => sub {
++    my ( $user, $debit_called, $debit_amount, $gratis_balance,
++        $credit_called, $credit_amount, $funds )
++        = build_mock_user( funds => 10.00 );
++    my $print_file = build_mock_print_file( pages => 5 );
++    my ( $print_job, $pj_status ) = build_mock_print_job(
++        type       => 'cups',
++        user_obj   => $user,
++        print_file => $print_file,
++    );
++
++    my ( $c, $stats ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => {
++            staff_print_release => 'enabled',
++            printers => { printer1 => { cost_per_page => 0.10, name => 'missing-cups-queue' } },
++        },
++    );
++
++    my $cups = Test::MockObject->new();
++    $cups->mock( 'getDestination', sub { return undef; } );
++
++    my $result;
++    {
++        no warnings 'redefine';
++        local *Libki::Utils::Printing::cups_setup = sub { return $cups; };
++        $result = Libki::Utils::Printing::release( $c, {
++            print_job_id => 1,
++            user         => $user,
++        });
++    }
++
++    is( $result->{success}, 0, 'Release fails when CUPS has no destination' );
++    is( $result->{safe_to_retry}, 1, 'Failure is known not to have submitted' );
++    is( $$debit_called, 1, 'Initial charge was recorded once' );
++    is( $$credit_called, 1, 'Automatic refund was recorded once' );
++    is( $$credit_amount, $$debit_amount, 'Refund exactly matches the charge' );
++    is( $$funds, 10.00, 'Net patron funds are unchanged' );
++    is( $$pj_status, 'Held', 'Job is restored to Held for a later staff retry' );
++    is( scalar( grep { $_->{action} eq 'PRINT_JOB_RELEASE_FAILED' } @$stats ), 1,
++        'Failed release is audited once' );
++    is( scalar( grep { $_->{action} eq 'PRINT_JOB_RELEASED' } @$stats ), 0,
++        'Failed release is not recorded as released' );
++};
++
++subtest 'Uncertain CUPS submission is not refunded or made retryable' => sub {
++    my ( $user, $debit_called, $debit_amount, $gratis_balance,
++        $credit_called, $credit_amount, $funds )
++        = build_mock_user( funds => 10.00 );
++    my $print_file = build_mock_print_file( pages => 5, filename => 'patron-document.pdf' );
++    my ( $print_job, $pj_status ) = build_mock_print_job(
++        type       => 'cups',
++        user_obj   => $user,
++        print_file => $print_file,
++    );
++
++    my ( $c, $stats ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => {
++            staff_print_release => 'enabled',
++            printers => { printer1 => { cost_per_page => 0.10, name => 'cpl-main-bw' } },
++        },
++    );
++
++    my $job_title;
++    my $destination = Test::MockObject->new();
++    $destination->mock( 'addOption', sub { return 1; } );
++    $destination->mock( 'printFile', sub {
++        my ( $self, $filename, $title ) = @_;
++        $job_title = $title;
++        die 'simulated connection loss during submission';
++    });
++    my $cups = Test::MockObject->new();
++    $cups->mock( 'getDestination', sub { return $destination; } );
++
++    my $result;
++    {
++        no warnings 'redefine';
++        local *Libki::Utils::Printing::cups_setup = sub { return $cups; };
++        $result = Libki::Utils::Printing::release( $c, {
++            print_job_id => 1,
++            user         => $user,
++        });
++    }
++
++    is( $result->{success}, 0, 'Uncertain submission stops the release' );
++    is( $result->{safe_to_retry}, 0, 'Uncertain submission is explicitly non-retryable' );
++    is( $result->{manual_review}, 1, 'Staff review is required' );
++    is( $$debit_called, 1, 'Charge remains singular' );
++    is( $$credit_called, 0, 'No unsafe automatic refund is created' );
++    isnt( $$pj_status, 'Held', 'Job cannot be released a second time' );
++    like( $job_title, qr{^libki-TEST-1-}, 'CUPS title carries the Libki job id' );
++    is( scalar( grep { $_->{action} eq 'PRINT_JOB_RELEASED' } @$stats ), 0,
++        'Uncertain release is not falsely recorded as successful' );
++};
++
++subtest 'Accepted CUPS job becomes terminal Done with queue audit fields' => sub {
++    my ( $user ) = build_mock_user();
++    my $print_file = build_mock_print_file( filename => 'accepted.pdf' );
++    my ( $print_job, $status, $update_called, $last_update )
++        = build_mock_print_job(
++            type       => 'cups',
++            status     => 'Pending',
++            user_obj   => $user,
++            print_file => $print_file,
++        );
++    my ( $c ) = build_mock_c(
++        user       => $user,
++        print_job  => $print_job,
++        print_file => $print_file,
++    );
++
++    my $destination = Test::MockObject->new();
++    $destination->mock( 'addOption', sub { return 1; } );
++    $destination->mock( 'printFile', sub { return 42; } );
++    $destination->mock( 'getJob', sub {
++        return { id => 42, state_text => 'processing' };
++    });
++    my $cups = Test::MockObject->new();
++    $cups->mock( 'getDestination', sub { return $destination; } );
++
++    my $result;
++    {
++        no warnings 'redefine';
++        local *Libki::Utils::Printing::cups_setup = sub { return $cups; };
++        $result = Libki::Utils::Printing::release_for_cups(
++            $c,
++            {
++                print_job  => $print_job,
++                print_file => $print_file,
++                printer    => {
++                    name     => 'cpl-main-bw',
++                    chroming => 'monochrome',
++                    plexing  => 'simplex',
++                },
++            }
++        );
++    }
++
++    is( $result->{success}, 1, 'Accepted CUPS submission succeeds' );
++    is( $$status, 'Done', 'Transient CUPS processing state becomes terminal Done' );
++    is( $last_update->{queued_to}, 'cpl-main-bw', 'Physical queue is recorded' );
++    is( $last_update->{queued_on}, '2026-02-13 12:00:00', 'Queue time is recorded' );
++};
++
++subtest 'CUPS options enforce queue color mode, simplex, and copies' => sub {
++    my ( $user ) = build_mock_user();
++    my ( $print_job ) = build_mock_print_job(
++        copies   => 3,
++        user_obj => $user,
++    );
++
++    my $options = Libki::Utils::Printing::cups_job_options(
++        $print_job,
++        {
++            chroming => 'monochrome',
++            plexing  => 'simplex',
++        }
++    );
++
++    is_deeply(
++        $options,
++        {
++            copies             => 3,
++            'print-color-mode' => 'monochrome',
++            sides              => 'one-sided',
++        },
++        'B&W queue policy cannot be overridden by client print-dialog choices'
++    );
++};
++
++subtest 'Staff release preview is side-effect free and authoritative' => sub {
++    my ( $patron, $debit_called ) = build_mock_user(
++        username  => '23691001000000',
++        firstname => 'Alex',
++        lastname  => 'Reader',
++    );
++    my $print_file = build_mock_print_file(
++        pages           => 5,
++        filename        => 'research.pdf',
++        client_name     => 'SAMPLE-PC-01',
++        client_location => 'CPL Main',
++    );
++    my ( $print_job, $status, $update_called ) = build_mock_print_job(
++        copies     => 2,
++        user_obj   => $patron,
++        print_file => $print_file,
++    );
++    my ( $c, $stats ) = build_mock_c(
++        user       => $patron,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => {
++            staff_print_release => 'disabled',
++            printers => {
++                printer1 => {
++                    cost_per_page => 0.35,
++                    public_printer_name => 'Main Floor - Color',
++                    release_location => 'the Main Floor service desk',
++                    allowed_client_locations => ['CPL Main'],
++                },
++            },
++        },
++    );
++
++    my $preview = Libki::Utils::Printing::build_release_preview(
++        $c, { print_job_id => 1 }
++    );
++
++    is( $preview->{success}, 1, 'Preview succeeds' );
++    is( $preview->{patron_name}, 'Alex Reader', 'Preview shows patron name' );
++    is( $preview->{library_card}, '23691001000000', 'Preview shows library card' );
++    is( $preview->{client_location}, 'CPL Main', 'Preview shows client location' );
++    is( $preview->{printer_name}, 'Main Floor - Color', 'Preview shows public printer name' );
++    is( $preview->{release_location}, 'the Main Floor service desk', 'Preview shows release desk' );
++    is( $preview->{total_pages}, 10, 'Preview multiplies pages by copies' );
++    is( $preview->{amount_due}, '3.50', 'Preview calculates authoritative amount' );
++    is( $preview->{release_allowed}, 0, 'Disabled mode cannot release' );
++    is( $$debit_called, 0, 'Preview performs no debit' );
++    is( $$update_called, 0, 'Preview does not update the job' );
++    is( scalar @$stats, 0, 'Preview creates no statistics' );
++};
++
++subtest 'Preview and release location helper reject a cross-site queue' => sub {
++    my ( $patron ) = build_mock_user();
++    my $print_file = build_mock_print_file( client_location => 'CPL Main' );
++    my ( $print_job ) = build_mock_print_job(
++        user_obj   => $patron,
++        print_file => $print_file,
++    );
++    my ( $c ) = build_mock_c(
++        user       => $patron,
++        print_job  => $print_job,
++        print_file => $print_file,
++        printer_config => {
++            printers => {
++                printer1 => {
++                    cost_per_page => 0.15,
++                    allowed_client_locations => ['CPL Genealogy'],
++                },
++            },
++        },
++    );
++
++    my $preview = Libki::Utils::Printing::build_release_preview(
++        $c, { print_job_id => 1 }
++    );
++    is( $preview->{success}, 0, 'Cross-site preview fails' );
++    is( $preview->{error}, 'PRINTER_NOT_AVAILABLE_AT_CLIENT_LOCATION',
++        'Cross-site error is explicit' );
++};
++
++subtest 'Completed CUPS job can create an audited production reprint' => sub {
++    my ( $patron ) = build_mock_user(
++        id       => 7,
++        username => '23691001077246',
++    );
++    my ( $staff ) = build_mock_user(
++        id       => 99,
++        username => 'library.staff',
++    );
++    my $print_file = build_mock_print_file(
++        id              => 400,
++        pages           => 2,
++        client_name     => 'SAMPLE-PC-01',
++        client_location => 'CPL Main',
++    );
++    my ( $source_job ) = build_mock_print_job(
++        id            => 41,
++        status        => 'Done',
++        type          => 'cups',
++        copies        => 2,
++        user_id       => 7,
++        print_file_id => 400,
++        user_obj      => $patron,
++        print_file    => $print_file,
++    );
++    my ( $new_job, $new_status ) = build_mock_print_job(
++        id            => 42,
++        status        => 'Held',
++        type          => 'cups',
++        copies        => 2,
++        user_id       => 7,
++        print_file_id => 400,
++        user_obj      => $patron,
++        print_file    => $print_file,
++    );
++    my ( $c, $stats, $created_jobs ) = build_mock_c(
++        user              => $patron,
++        c_user            => $staff,
++        print_job         => $source_job,
++        created_print_job => $new_job,
++        print_file        => $print_file,
++        is_admin          => 1,
++        printer_config    => {
++            staff_print_release => 'enabled',
++            printers => {
++                printer1 => {
++                    cost_per_page => 0.15,
++                    allowed_client_locations => ['CPL Main'],
++                },
++            },
++        },
++    );
++
++    my $preview = Libki::Utils::Printing::build_release_preview(
++        $c, { print_job_id => 41 }
++    );
++    is( $preview->{release_allowed}, 0, 'Completed source cannot be released again' );
++    is( $preview->{reprint_allowed}, 1, 'Completed CUPS source can be reprinted' );
++    is( $preview->{action_mode}, 'reprint', 'Preview selects reprint mode' );
++    is( $preview->{amount_due}, '0.60', 'Reprint uses authoritative current price' );
++
++    my $result = Libki::Utils::Printing::create_reprint_job(
++        $c,
++        {
++            print_job_id    => 41,
++            expected_amount => '0.60',
++        }
++    );
++
++    is( $result->{success}, 1, 'Reprint job creation succeeds' );
++    is( $result->{source_print_job_id}, 41, 'Original job remains the source' );
++    is( $result->{reprint_job_id}, 42, 'New job id is returned' );
++    is( scalar @$created_jobs, 1, 'Exactly one new print job is created' );
++    is( $created_jobs->[0]->{status}, 'Held', 'New job enters normal Held workflow' );
++    is( $created_jobs->[0]->{print_file_id}, 400, 'New job safely reuses retained PDF' );
++    is( $created_jobs->[0]->{printer}, 'printer1', 'New job preserves authoritative queue' );
++    is( scalar( grep { $_->{action} eq 'PRINT_JOB_REPRINT_CREATED' } @$stats ), 1,
++        'Reprint creation is audited once' );
++    is( $source_job->status, 'Done', 'Original completed history is unchanged' );
++    is( $$new_status, 'Held', 'New job remains held until normal release claims it' );
++};
++
++subtest 'Confirmed staff cash release records cash without debiting patron funds' => sub {
++    my ( $patron, $debit_called, $debit_amount, $gratis_balance,
++        $credit_called, $credit_amount, $funds )
++        = build_mock_user( funds => 0, username => '23691001000001' );
++    my ( $staff ) = build_mock_user( id => 99, username => 'library.staff' );
++    my $print_file = build_mock_print_file( pages => 5 );
++    my ( $print_job, $status ) = build_mock_print_job(
++        type       => 'PrintManager',
++        user_obj   => $patron,
++        print_file => $print_file,
++    );
++    my ( $c, $stats ) = build_mock_c(
++        user       => $patron,
++        c_user     => $staff,
++        print_job  => $print_job,
++        print_file => $print_file,
++        is_admin   => 1,
++        printer_config => {
++            staff_print_release => 'enabled',
++            printers => { printer1 => { cost_per_page => 0.10 } },
++        },
++    );
++
++    my $result = Libki::Utils::Printing::release(
++        $c,
++        {
++            print_job_id    => 1,
++            payment_method  => 'cash',
++            expected_amount => '0.50',
++        }
++    );
++
++    is( $result->{success}, 1, 'Cash release succeeds' );
++    is( $$debit_called, 0, 'Cash release does not debit patron funds' );
++    is( $$funds, 0, 'Patron funds remain unchanged' );
++    is( $$status, 'Pending', 'Released job moves to Pending' );
++    is( scalar( grep { $_->{action} eq 'PRINT_PAYMENT_CASH' } @$stats ), 1,
++        'Cash receipt is audited once' );
++    is( scalar( grep { $_->{action} eq 'PRINT_JOB_RELEASED' } @$stats ), 1,
++        'Release is audited once' );
++};
++
++subtest 'Stale reviewed cash amount is rejected before claiming the job' => sub {
++    my ( $patron, $debit_called ) = build_mock_user( funds => 0 );
++    my ( $staff ) = build_mock_user( id => 99, username => 'library.staff' );
++    my $print_file = build_mock_print_file( pages => 5 );
++    my ( $print_job, $status, $update_called ) = build_mock_print_job(
++        type       => 'PrintManager',
++        user_obj   => $patron,
++        print_file => $print_file,
++    );
++    my ( $c, $stats ) = build_mock_c(
++        user       => $patron,
++        c_user     => $staff,
++        print_job  => $print_job,
++        print_file => $print_file,
++        is_admin   => 1,
++        printer_config => {
++            staff_print_release => 'enabled',
++            printers => { printer1 => { cost_per_page => 0.10 } },
++        },
++    );
++
++    my $result = Libki::Utils::Printing::release(
++        $c,
++        {
++            print_job_id    => 1,
++            payment_method  => 'cash',
++            expected_amount => '0.40',
++        }
++    );
++
++    is( $result->{success}, 0, 'Stale amount fails' );
++    is( $result->{error}, 'PRINT_COST_CHANGED', 'Stale amount error is explicit' );
++    is( $result->{amount_due}, '0.50', 'Current amount is returned' );
++    is( $$status, 'Held', 'Job remains Held' );
++    is( $$debit_called, 0, 'No debit occurs' );
++    is( $$update_called, 0, 'Job is not claimed' );
++    is( scalar @$stats, 0, 'No cash or release audit is written' );
++};
++
++subtest 'Disabled staff CUPS release is blocked before accounting or submission' => sub {
++    my ( $patron, $debit_called ) = build_mock_user( funds => 0 );
++    my ( $staff ) = build_mock_user( id => 99, username => 'library.staff' );
++    my $print_file = build_mock_print_file( pages => 1 );
++    my ( $print_job, $status, $update_called ) = build_mock_print_job(
++        type       => 'cups',
++        user_obj   => $patron,
++        print_file => $print_file,
++    );
++    my ( $c, $stats ) = build_mock_c(
++        user       => $patron,
++        c_user     => $staff,
++        print_job  => $print_job,
++        print_file => $print_file,
++        is_admin   => 1,
++        printer_config => {
++            staff_print_release => 'disabled',
++            printers => { printer1 => { cost_per_page => 0.15 } },
++        },
++    );
++
++    my $result = Libki::Utils::Printing::release(
++        $c,
++        {
++            print_job_id    => 1,
++            payment_method  => 'cash',
++            expected_amount => '0.15',
++        }
++    );
++
++    is( $result->{success}, 0, 'Disabled CUPS release fails' );
++    is( $result->{error}, 'STAFF_PRINT_RELEASE_DISABLED', 'Safety gate is explicit' );
++    is( $$status, 'Held', 'Job remains Held' );
++    is( $$debit_called, 0, 'No debit occurs' );
++    is( $$update_called, 0, 'Job is not claimed' );
++    is( scalar @$stats, 0, 'No accounting or release audit is written' );
++};
++
++
++
++subtest 'Staff quantities are authoritative and duplicate release is safe' => sub {
++    for my $price (0.15,0.35) {
++        my ($patron)=build_mock_user(funds=>0);
++        my ($staff)=build_mock_user(id=>99,username=>'test.staff');
++        my $file=build_mock_print_file(pages=>4);
++        my ($job,$status)=build_mock_print_job(type=>'PrintManager',user_obj=>$patron,print_file=>$file);
++        $job->mock('data',sub{return undef;});
++        my ($c,$stats)=build_mock_c(user=>$patron,c_user=>$staff,print_job=>$job,print_file=>$file,is_admin=>1,
++            printer_config=>{staff_print_release=>'enabled',printers=>{printer1=>{cost_per_page=>$price}}});
++        my $preview=Libki::Utils::Printing::build_release_preview($c,{print_job_id=>1,copies=>3});
++        is($preview->{total_pages},12,'copies multiply the document page count');
++        is($preview->{amount_due},sprintf('%.2f',12*$price),'authoritative pricing');
++        is($job->copies,1,'preview does not mutate the stored copy count');
++        for my $invalid (0,100,-1,'abc','1.5') {
++            my $r=Libki::Utils::Printing::release($c,{print_job_id=>1,payment_method=>'cash',copies=>$invalid,expected_amount=>$preview->{amount_due}});
++            is($r->{error},'INVALID_COPIES','invalid quantity rejected');
++            is($$status,'Held','invalid quantity leaves job held');
++        }
++        my $stale=Libki::Utils::Printing::release($c,{print_job_id=>1,payment_method=>'cash',copies=>3,expected_amount=>'0.01'});
++        is($stale->{error},'PRINT_COST_CHANGED','stale quote rejected');
++        is($job->copies,1,'stale price does not change copies');
++        my $r=Libki::Utils::Printing::release($c,{print_job_id=>1,payment_method=>'cash',copies=>3,expected_amount=>$preview->{amount_due}});
++        ok($r->{success},'reviewed three-copy job released');
++        is($job->copies,3,'copy count saved with claim');
++        my $retry=Libki::Utils::Printing::release($c,{print_job_id=>1,payment_method=>'cash',copies=>3,expected_amount=>$preview->{amount_due}});
++        ok(!$retry->{success},'duplicate release blocked');
++        is(scalar(grep {$_->{action} eq 'PRINT_PAYMENT_CASH'} @$stats),1,'cash audited only once');
++        my $options=Libki::Utils::Printing::cups_job_options($job,{});
++        is($options->{copies},3,'CUPS receives copy count in one job');
++    }
++};
++
++
++subtest 'Reprint quantity preserves source and repeated request creates one job' => sub {
++    my ($patron)=build_mock_user(funds=>0);
++    my ($staff)=build_mock_user(id=>99,username=>'test.staff');
++    my $file=build_mock_print_file(pages=>1);
++    my ($source)=build_mock_print_job(id=>1,type=>'cups',status=>'Done',copies=>1,user_obj=>$patron,print_file=>$file);
++    my ($created)=build_mock_print_job(id=>2,type=>'cups',status=>'Held',copies=>16,user_obj=>$patron,print_file=>$file);
++    my ($c,$stats,$jobs)=build_mock_c(user=>$patron,c_user=>$staff,print_job=>$source,created_print_job=>$created,
++        print_file=>$file,is_admin=>1,printer_config=>{staff_print_release=>'enabled',printers=>{printer1=>{cost_per_page=>0.15}}});
++    my $params={print_job_id=>1,copies=>16,expected_amount=>'2.40',request_id=>'00000000-0000-0000-0000-000000000001'};
++    my $r=Libki::Utils::Printing::create_reprint_job($c,$params);
++    ok($r->{success},'16-copy reprint created');
++    is($jobs->[0]{copies},16,'copies saved in new job');
++    is($source->copies,1,'source remains unchanged');
++    my $retry=Libki::Utils::Printing::create_reprint_job($c,$params);
++    ok($retry->{success},'same request retrieves existing job');
++    is($retry->{reprint_job_id},2,'same job ID');
++    is(scalar(@$jobs),1,'duplicate request creates only one job');
++};
++
++done_testing();
+diff --git a/t/printing_batch_browser.py b/t/printing_batch_browser.py
+new file mode 100644
+index 0000000..a07f800
+--- /dev/null
++++ b/t/printing_batch_browser.py
+@@ -0,0 +1,245 @@
++"""Print selection: shipped DataTables/template code, synthetic HTTP only.
++Run in simon/browser-admin with --network none; never contacts production/CUPS.
++"""
++import asyncio,json,re,os
++from pathlib import Path
++from urllib.parse import urlparse,parse_qs
++from playwright.async_api import async_playwright
++
++async def main():
++    source=Path('/work/root/dynamic/templates/administration/index.tt').read_text()
++    def expand(js):
++        js=re.sub(r"\[% IF !c.language.match\('en'\) %\].*?\[% END %\]",'',js,flags=re.S)
++        js=re.sub(r"\[% c.uri_for\([\"']([^\"']+)[\"']\) %\]",lambda m:'/administration/'+m[1] if not m[1].startswith('/') else m[1],js)
++        return re.sub(r"\[% c.loc\([\"']([^\"']+)[\"']\) %\]",lambda m:m[1],js)
++    start=source.index('    const selectedPrintJobs = new Set();')
++    queue=expand(source[start:source.index('    /*********** Page Wide Actions',start)])
++    start=source.index("    $('#print-table').on('click', '.print-select'")
++    review=expand(source[start:source.index('    /* Refresh Print Job */',start)])
++    start=source.index('<table id="print-table"')
++    table=expand(source[start:source.index('</table>',start)+8])
++    mainjs=Path('/work/root/static/js/main.js').read_text()
++    start=mainjs.index('function AddTableRowToolbar(')
++    toolbar=mainjs[start:mainjs.index('\n}\n',start)+3]
++    fixtures={}
++    for n in range(1,22):
++        route=['Main - B&W','Main - Color','Genealogy - B&W','Genealogy - Color'][(n-1)%4]
++        fixtures[str(n)]={'filename':f'Document {n}.pdf','printer_name':route,
++            'pages':1 if n in [1,4] else 2,'copies':2 if n==4 else 1,
++            'library_card':'synthetic-patron','identifier_label':'Patron',
++            'status':'Held','rate':.35 if 'Color' in route else .15}
++    fixtures['90']={**fixtures['1'],'status':'Done'}
++    fixtures['91']={**fixtures['1'],'status':'Pending'}
++    state={'visible':['1','2','3','4','90','91'],'quote_failure':None,
++           'outcomes':{},'delay':False}
++    posts=[];errors=[];messages=[];in_flight=0;max_in_flight=0
++    async with async_playwright() as p:
++        browser=await p.chromium.launch(headless=True,args=['--no-sandbox'])
++        page=await browser.new_page(viewport={'width':1366,'height':900})
++        page.set_default_timeout(7000)
++        page.on('pageerror',lambda e:errors.append(str(e)))
++        async def route(r):
++            nonlocal in_flight,max_in_flight
++            q=parse_qs(urlparse(r.request.url).query)
++            if '/datatables/prints' in r.request.url:
++                data=[]
++                for id in state['visible']:
++                    f=fixtures[id]
++                    data.append({'0':'cups','1':f['status'],'2':f['printer_name'],
++                        '3':f['copies'],'4':f['filename'],'5':f['pages'],'6':'SYNTHETIC-PC',
++                        '7':f['library_card'],'8':'2026-10-30T12:00:00','DT_RowId':id})
++                return await r.fulfill(json={'draw':int(q.get('draw',['1'])[0]),
++                    'recordsTotal':len(data),'recordsFiltered':len(data),'data':data})
++            if '/preview' in r.request.url:
++                id=q['id'][0]; f=fixtures[id]
++                if state['delay'] and id=='1': await asyncio.sleep(.25)
++                if state['quote_failure']==id:
++                    return await r.fulfill(status=503,body='Synthetic failure')
++                count=int(q.get('copies',[str(f['copies'])])[0])
++                return await r.fulfill(json={'success':1,
++                    'action_mode':'reprint' if f['status']=='Done' else ('release' if f['status']=='Held' else 'none'),
++                    **{k:f[k] for k in ['filename','printer_name','pages','library_card','identifier_label']},
++                    'copies':count,'total_pages':f['pages']*count,
++                    'amount_due':f"{f['pages']*count*f['rate']:.2f}"})
++            if r.request.method=='POST':
++                assert '/release' in r.request.url or '/reprint' in r.request.url
++                body={k:v[0] for k,v in parse_qs(r.request.post_data).items()}
++                posts.append({'url':r.request.url,**body})
++                in_flight+=1;max_in_flight=max(max_in_flight,in_flight)
++                await asyncio.sleep(.08)
++                in_flight-=1
++                result=state['outcomes'].get(body['id'],'accept')
++                if result=='network': return await r.abort()
++                if result=='expired': return await r.fulfill(status=401,json={'success':0})
++                if result=='fail': return await r.fulfill(json={'success':0,'safe_to_retry':1,'error':'SYNTHETIC_SAFE_FAILURE'})
++                if result=='uncertain': return await r.fulfill(json={'success':0,'safe_to_retry':0,'manual_review':1,'error':'SYNTHETIC_UNKNOWN'})
++                return await r.fulfill(json={'success':1})
++            if r.request.url=='https://print-stage.test/':
++                return await r.fulfill(content_type='text/html',body='<html><body>'+
++                    table+'<div id="print-table-row-toolbar"><button id="print-table-row-toolbar-release" hidden>Reprint</button></div></body></html>')
++            return await r.abort()
++        await page.route('**/*',route)
++        await page.goto('https://print-stage.test/')
++        for asset in ['jquery.js','bootstrap.js','datatables.js','datatables-bootstrap.js']:
++            await page.add_script_tag(content=Path('/assets/'+asset).read_text())
++        await page.add_script_tag(content=toolbar+"""
++            const testMessages=[];
++            function DisplayMessage(type,text){testMessages.push(text);}
++            function ForcePrintTableRefresh(){pTable.ajax.reload(null,false);}
++        """+queue+review)
++        await page.wait_for_selector('.print-select')
++        button=page.locator('#print-selected-button')
++        assert await button.is_disabled()
++        assert await page.locator('#print-table thead th').first.inner_text()=='Select'
++        assert 'cups' not in await page.locator('#print-table tbody').inner_text()
++        assert await page.locator('.print-select').count()==4
++        assert await page.get_by_role('button',name='Release selected',exact=True).count()==0
++        async def select(*ids):
++            for id in ids: await page.locator(f'.print-select[data-print-id="{id}"]').check()
++        async def close():
++            await page.locator('.print-close').click()
++            await page.wait_for_selector('#staff-print-review',state='detached')
++        async def total(amount):
++            await page.wait_for_function("(v)=>document.querySelector('.print-total').textContent.includes(v)",arg=amount)
++        async def reload():
++            await page.evaluate("ForcePrintTableRefresh()")
++            await page.wait_for_timeout(180)
++        await select('1','4')
++        assert await button.inner_text()=='Print selected (2)'
++        await button.click(); await total('$0.85')
++        assert await page.locator('.print-copies').evaluate_all('(els)=>els.map(el=>el.value)')==['1','2']
++        assert await page.locator('.print-printer').all_text_contents()==['Main - B&W','Genealogy - Color']
++        await page.locator('.print-copies').nth(1).fill('5')
++        await total('$1.90')
++        assert 'Total printed pages: 6' in await page.locator('.print-total').inner_text()
++        assert await page.locator('.print-line-total').all_text_contents()==['$0.15','$1.75']
++        assert await page.locator('.print-submit').is_disabled()
++        await page.locator('.print-cash').check()
++        assert await page.locator('.print-submit').is_enabled()
++        await page.locator('.print-copies').first.fill('16')
++        await total('$4.15')
++        assert not await page.locator('.print-cash').is_checked()
++        for bad in ['0','100','1.5','']:
++            await page.locator('.print-copies').first.fill(bad)
++            assert await page.locator('.print-submit').is_disabled()
++            assert await page.locator('.print-cash').is_disabled()
++        await page.locator('.print-copies').first.fill('99')
++        await total('$16.60')
++        await close()
++        assert not posts
++        # Selection retained on same-page refresh, removed if hidden/non-held.
++        await reload()
++        assert await button.inner_text()=='Print selected (2)'
++        state['visible']=['2','3','90','91']; await reload()
++        assert await button.inner_text()=='Print selected (0)'
++        assert await button.is_disabled()
++        await select('2')
++        fixtures['2']['status']='Pending';await reload()
++        assert await button.is_disabled()
++        fixtures['2']['status']='Held'
++        state['visible']=['1','2','3','4','90','91'];await reload()
++        # History reprint remains available only on completed row hover.
++        await page.locator('tr[id="1"]').hover()
++        assert await page.locator('#print-table-row-toolbar-release').is_hidden()
++        await page.locator('tr[id="90"]').hover()
++        await page.locator('#print-table-row-toolbar-release').click()
++        await total('$0.15')
++        assert 'Additional reprint' in await page.locator('.print-total').inner_text()
++        assert await page.locator('.print-submit').inner_text()=='Reprint document'
++        await close()
++        # 20-job cap both in checkbox interaction and direct review entry.
++        state['visible']=[str(n) for n in range(1,22)];await reload()
++        await page.evaluate("pTable.page.len(100).draw()")
++        await page.wait_for_timeout(180)
++        await select(*[str(n) for n in range(1,21)])
++        await page.locator('.print-select[data-print-id="21"]').click()
++        assert not await page.locator('.print-select[data-print-id="21"]').is_checked()
++        assert await button.inner_text()=='Print selected (20)'
++        await button.click();await page.wait_for_function("document.querySelectorAll('.print-line-total').length===20 && !document.querySelector('.print-cash').disabled")
++        assert await page.locator('.print-copies').count()==20
++        await close()
++        await page.evaluate("openPrintReview(Array.from({length:21},(_,i)=>String(i+1)),true)")
++        assert await page.locator('#staff-print-review').count()==0
++        # Queue switch clears selection even when rows still held.
++        await page.locator('select[aria-label="Print queue view"]').select_option('all')
++        await page.wait_for_timeout(180)
++        assert await button.is_disabled()
++        # Mixed four-route totals: 0.15 + 0.70 + 0.30 + 0.70 = 1.85.
++        state['visible']=['1','2','3','4'];await reload()
++        await select('1','2','3','4')
++        state['quote_failure']='3'
++        await button.click()
++        await page.wait_for_function("document.querySelector('.print-total').textContent.includes('Total unavailable')")
++        assert await page.locator('.print-cash').is_disabled()
++        assert await page.locator('.print-submit').is_disabled()
++        await close()
++        state['quote_failure']=None;state['delay']=True
++        await button.click();await total('$1.85')
++        state['delay']=False
++        # Only synthetic intercepted POSTs: sequential, partial outcomes and double click.
++        state['outcomes']={'2':'fail','3':'uncertain','4':'network'}
++        await page.locator('.print-cash').check()
++        await page.evaluate("$('.print-submit').trigger('click');$('.print-submit').trigger('click')")
++        await page.wait_for_function("document.querySelector('.print-close').textContent==='Close'")
++        assert len(posts)==4 and max_in_flight==1
++        assert [x['id'] for x in posts]==['1','2','3','4']
++        assert [x['copies'] for x in posts]==['1','1','1','2']
++        assert [x['expected_amount'] for x in posts]==['0.15','0.70','0.30','0.70']
++        assert all(x['cash_received']=='1' and x['request_id'] for x in posts)
++        result=await page.locator('.print-results').inner_text()
++        for expected in ['Accepted by print system','NOT released','STATUS UNCERTAIN','Request failed']:
++            assert expected in result,result
++        await page.evaluate("$('.print-submit').trigger('click')")
++        await page.wait_for_timeout(150);assert len(posts)==4
++        await close()
++        # Expired session stops unattempted jobs; never resubmit automatically.
++        await select('1','2','3','4');await button.click();await total('$1.85')
++        state['outcomes']={'1':'expired'}
++        await page.locator('.print-cash').check();await page.locator('.print-submit').click()
++        await page.wait_for_function("document.querySelector('.print-close').textContent==='Close'")
++        assert len(posts)==5
++        assert (await page.locator('.print-results').inner_text()).count('NOT attempted')==3
++        await close()
++        assert not errors,errors
++        messages=await page.evaluate('testMessages')
++        assert len(messages)==2,messages
++        # Review images: actual exported UI with synthetic data and intercepted HTTP.
++        if os.environ.get('PRINT_SCREENSHOTS'):
++            for asset in ['bootstrap-4.0.0.min.css','dataTables.bootstrap4.min.css']:
++                await page.add_style_tag(content=Path('/assets/'+asset).read_text())
++            await page.add_style_tag(content=Path('/work/root/static/css/main.css').read_text())
++            await page.add_style_tag(content="body {padding:24px;background:#f5f7fa;} .review-banner {padding:12px;background:#17334d;color:white;margin-bottom:20px;border-radius:4px;}")
++            await page.evaluate("""document.body.insertAdjacentHTML('afterbegin','<div class="review-banner">Libki staff printing — review preview • sample documents and prices</div>')""")
++            state['visible']=['1','2','3','4'];state['outcomes']={}
++            await reload()
++            await select('1','4')
++            await page.screenshot(path='/out/01-staff-select-documents.png',full_page=True)
++            await button.click();await total('$0.85')
++            await page.locator('#staff-print-review .modal-content').screenshot(path='/out/02-staff-price-total.png')
++            await page.locator('.print-copies').nth(1).fill('5');await total('$1.90')
++            await page.locator('#staff-print-review .modal-content').screenshot(path='/out/03-staff-per-document-copies.png')
++            await page.locator('.print-cash').check()
++            await page.locator('#staff-print-review .modal-content').screenshot(path='/out/04-staff-cash-confirmation.png')
++            await page.locator('.print-submit').click()
++            await page.wait_for_function("document.querySelector('.print-close').textContent==='Close'")
++            await page.locator('#staff-print-review .modal-content').screenshot(path='/out/05-staff-release-results.png')
++            await close()
++            state['visible']=['90'];await reload()
++            await page.locator('tr[id="90"]').hover()
++            await page.locator('#print-table-row-toolbar-release').click();await total('$0.15')
++            await page.locator('#staff-print-review .modal-content').screenshot(path='/out/06-staff-reprint-review.png')
++            await close()
++            state['visible']=['1','2','3','4'];state['outcomes']={'2':'fail','3':'uncertain','4':'network'}
++            await reload();await select('1','2','3','4');await button.click();await total('$1.85')
++            await page.locator('.print-cash').check();await page.locator('.print-submit').click()
++            await page.wait_for_function("document.querySelector('.print-close').textContent==='Close'")
++            await page.locator('#staff-print-review .modal-content').screenshot(path='/out/07-staff-partial-results.png')
++            await close()
++        await browser.close()
++    print(json.dumps({'result':'PASS','synthetic_posts':len(posts),'production_posts':0,
++        'checks':['dedicated Select/no CUPS','one Print selected control','stored quantities','per-file copies/prices',
++        'Main/Genealogy four routes','cash reset/invalid quantities','same-page refresh/hidden selection pruning',
++        'history reprint','20-job limit','failed/delayed pricing','sequential partial outcomes',
++        'double-click/completed-submit guard','session-expiry stops remaining jobs']}))
++
++asyncio.run(main())
+diff --git a/t/printing_db_acceptance.t b/t/printing_db_acceptance.t
+new file mode 100644
+index 0000000..af1892e
+--- /dev/null
++++ b/t/printing_db_acceptance.t
+@@ -0,0 +1,130 @@
++use Modern::Perl;
++use Test::More;
++use Test::MockObject;
++use DateTime;
++use HTTP::Headers;
++use JSON qw(from_json);
++use Libki::Schema::DB;
++use Libki::Utils::Printing;
++use Libki::Controller::Administration::API::PrintJob;
++use Libki::Controller::Administration::API::DataTables;
++# Real schema/controller, synthetic in-memory data; network-disabled container.
++# CUPS is mocked: this cannot establish physical output acceptance.
++my $db=Libki::Schema::DB->connect('dbi:SQLite:dbname=:memory:');
++# Serializer override loses the loader's nullable flag during deploy only.
++$db->source('PrintJob')->column_info('data')->{is_nullable}=1;
++$db->deploy;
++my $now=DateTime->new(year=>2026,month=>10,day=>28,hour=>12);
++my $user=$db->resultset('User')->create({instance=>'ACCEPTANCE',username=>'synthetic-patron',password=>'unused',status=>'enabled',created_on=>$now,updated_on=>$now});
++my $params={}; my $stash={}; my $http=200; my $is_admin=1; my $method='POST';
++my $headers=HTTP::Headers->new('X-Requested-With'=>'XMLHttpRequest');
++my $config={staff_print_release=>'enabled',printers=>{}};
++for my $loc ('Main','Genealogy') { for my $mode ('bw','color') {
++ $config->{printers}{lc($loc).'-'.$mode}={cost_per_page=>$mode eq 'bw'?0.15:0.35,locations=>['CPL '.$loc],public_name=>$loc.' '.$mode,release_location=>$loc.' desk'};
++}}
++my $req=Test::MockObject->new;
++$req->mock(params=>sub{$params});$req->mock(param=>sub{$params->{$_[1]}});
++$req->mock(method=>sub{$method});$req->mock(headers=>sub{$headers});
++my $res=Test::MockObject->new;$res->mock(status=>sub{$http=$_[1] if @_>1;return $http});
++my $log=Test::MockObject->new;for my $m(qw(info debug error warn)){$log->mock($m,sub{})}
++my $c=Test::MockObject->new;
++$c->mock(instance=>sub{'ACCEPTANCE'});$c->mock(now=>sub{$now});$c->mock(user=>sub{$user});
++$c->mock(sessionid=>sub{'synthetic-session'});$c->mock(setting=>sub{''});$c->mock(log=>sub{$log});
++$c->mock(check_user_roles=>sub{$is_admin});$c->mock(assert_user_roles=>sub{die 'ACCESS_DENIED' unless $is_admin});
++$c->mock(request=>sub{$req});$c->mock(response=>sub{$res});$c->mock(get_printer_configuration=>sub{$config});
++$c->mock(model=>sub{my $name=$_[1];return $db if $name eq 'DB';$name=~s/^DB:://;return $db->resultset($name)});
++$c->mock(stash=>sub{shift;if(@_){my %v=@_==1?%{$_[0]}:@_;%$stash=(%$stash,%v)}return $stash});
++$c->mock(view=>sub{'JSON'});$c->mock(forward=>sub{});$c->mock(format_dt=>sub{$_[1]{dt}->iso8601});
++my $controller=Libki::Controller::Administration::API::PrintJob->new;
++my $tables=Libki::Controller::Administration::API::DataTables->new;
++my $backend='accept';my @submissions;
++{ no warnings 'redefine';
++ *Libki::Utils::Printing::cups_setup=sub{die 'REAL CUPS FORBIDDEN'};
++ *Libki::Utils::Printing::release_for_cups=sub{
++  my ($ctx,$data)=@_;my $job=$data->{print_job};
++  push @submissions,{id=>$job->id,copies=>$job->copies,printer=>$job->printer};
++  return {success=>0,error=>'SIMULATED_PRE_SUBMIT_FAILURE',safe_to_retry=>1} if $backend eq 'fail';
++  return {success=>0,error=>'SIMULATED_UNCERTAIN_ACCEPTANCE',safe_to_retry=>0,manual_review=>1} if $backend eq 'uncertain';
++  $job->update({status=>'Done',queued_to=>$job->printer,queued_on=>$now});
++  return {success=>1,message=>'Mock backend accepted'};
++ };
++}
++my $seq=0;
++sub fixture {
++ my (%v)=@_;my $n=++$seq;my $loc=$v{location}//'Main';my $inst=$v{instance}//'ACCEPTANCE';
++ my $file=$db->resultset('PrintFile')->create({instance=>$inst,filename=>"synthetic-$n.pdf",content_type=>'application/pdf',data=>'synthetic-not-a-real-pdf',pages=>$v{pages}//2,client_name=>"SYNTHETIC-$loc",client_location=>"CPL $loc",username=>'synthetic-patron',user_id=>$user->id,created_on=>$now,updated_on=>$now});
++ return $db->resultset('PrintJob')->create({instance=>$inst,type=>'cups',status=>$v{status}//'Held',copies=>1,printer=>lc($loc).'-'.($v{mode}//'color'),user_id=>$user->id,print_file_id=>$file->id,created_on=>$now->clone->add(seconds=>$n),updated_on=>$now});
++}
++sub request {my ($action,%v)=@_;$params={%v};$stash={};$http=200;$controller->$action($c);return {%$stash}}
++sub refresh {$_[0]->discard_changes;return $_[0]}
++subtest '408: all four queues, quantities and guarded cash controller' => sub {
++ for my $loc ('Main','Genealogy') {for my $mode ('bw','color') {
++  my $job=fixture(location=>$loc,mode=>$mode);
++  for my $copies (1,5,16,99) {
++   my $p=Libki::Utils::Printing::build_release_preview($c,{print_job_id=>$job->id,copies=>$copies});
++   ok($p->{success},"$loc $mode $copies quote");is($p->{total_pages},2*$copies,'pages multiplied');
++   is($p->{amount_due},sprintf('%.2f',2*$copies*($mode eq 'bw'?0.15:0.35)),'correct amount');
++   is(refresh($job)->copies,1,'preview immutable');
++  }
++  my %v=(id=>$job->id,copies=>5,expected_amount=>$mode eq 'bw'?'1.50':'3.50',cash_received=>1);
++  my $before=@submissions;
++  is(request('release',%v,cash_received=>0)->{error},'CASH_PAYMENT_NOT_CONFIRMED','cash gate');
++  $method='GET';is(request('release',%v)->{error},'METHOD_NOT_ALLOWED','GET blocked');$method='POST';
++  $headers->remove_header('X-Requested-With');is(request('release',%v)->{error},'INVALID_RELEASE_REQUEST','XHR gate');
++  $headers->header('X-Requested-With'=>'XMLHttpRequest');
++  is(request('release',%v,expected_amount=>'0.01')->{error},'PRINT_COST_CHANGED','stale price blocked');
++  is(scalar @submissions,$before,'rejections never submit');
++  ok(request('release',%v)->{success},'confirmed release');ok(!request('release',%v)->{success},'duplicate blocked');
++  is(scalar @submissions,$before+1,'one backend invocation');is(refresh($job)->copies,5,'quantity persisted');
++ }}
++};
++subtest '410: actual DB pending/history/location/search/sort/pagination' => sub {
++ $db->resultset('Statistic')->delete_all;$db->resultset('PrintJob')->delete_all;
++ for my $loc ('Main','Genealogy') {for my $status(qw(Held Pending InProgress Done Canceled)){fixture(location=>$loc,status=>$status)}}
++ fixture(instance=>'OTHER',status=>'Held');
++ my $query=sub{my %v=@_;$params={queue_view=>'pending',length=>100,start=>0,'order[0][column]'=>8,'order[0][dir]'=>'desc',%v};$stash={};$tables->prints($c);return {%$stash}};
++ my $r=$query->();is($r->{recordsTotal},10,'instance scoped total');is($r->{recordsFiltered},6,'six pending/attention states');
++ ok(!grep({$_->{'1'} eq 'Done'||$_->{'1'} eq 'Canceled'} @{$r->{data}}),'terminal jobs excluded');
++ my @ids=map{$_->{DT_RowId}}@{$r->{data}};is_deeply(\@ids,[sort{$b<=>$a}@ids],'newest first');
++ $r=$query->(queue_view=>'all');is($r->{recordsFiltered},10,'history retained');
++ $r=$query->(queue_view=>'all','search[value]'=>'Done',location_filter=>'CPL Genealogy');
++ is($r->{recordsFiltered},1,'history search + Genealogy');is($r->{data}[0]{'1'},'Done','completed row found');
++ $r=$query->(location_filter=>'CPL Main');is($r->{recordsFiltered},3,'Main pending only');
++ is_deeply($query->(location_filter=>'CPL Main'),$r,'refresh consistent');
++ $r=$query->(length=>2,start=>2);is(scalar @{$r->{data}},2,'pagination');is($r->{recordsFiltered},6,'count stable');
++ is($query->('search[value]'=>'absent')->{recordsFiltered},0,'empty search');
++};
++subtest '409: 16 copies and accepted/failed/uncertain replay on all queues' => sub {
++ for my $loc ('Main','Genealogy') {for my $mode ('bw','color') {for my $case ('accept','fail','uncertain') {
++  $backend=$case;my $source=fixture(location=>$loc,mode=>$mode,status=>'Done');
++  my %original=refresh($source)->get_columns;my $before=@submissions;my $before_jobs=$db->resultset('PrintJob')->count;
++  my %v=(id=>$source->id,copies=>16,cash_received=>1,expected_amount=>$mode eq 'bw'?'4.80':'11.20',request_id=>sprintf('acceptance-20261028-%08d',$source->id));
++  my $result=request('reprint',%v);my $newid=$result->{reprint_job_id};ok($newid,"$loc $mode $case new job");
++  my $new=$db->resultset('PrintJob')->find($newid);is($new->copies,16,'16 copies in one job');
++  is($new->printer,$source->printer,'routing preserved');is($db->resultset('PrintJob')->count,$before_jobs+1,'one new job');
++  is_deeply({refresh($source)->get_columns},\%original,'original immutable');
++  if($case eq 'accept'){
++   ok($result->{success},'accepted');ok(request('reprint',%v)->{success},'accepted replay succeeds');
++   is(scalar @submissions,$before+1,'replay not resubmitted');
++  }elsif($case eq 'fail'){
++   ok(!$result->{success},'failure reported');is(refresh($new)->status,'Held','known failure restored Held');
++   $backend='accept';my $retry=request('reprint',%v);ok($retry->{success},'safe retry succeeds');is($retry->{reprint_job_id},$newid,'same retry job');
++   is(scalar @submissions,$before+2,'one failed attempt then one accepted');
++  }else{
++   ok(!$result->{success},'uncertain reported');is(refresh($new)->status,'Pending','uncertain stays non-releasable');
++   ok(!request('reprint',%v)->{success},'uncertain replay blocked');is(scalar @submissions,$before+1,'no second uncertain submission');
++  }
++  is($db->resultset('PrintJob')->count,$before_jobs+1,'no duplicate job after replay');
++  my @cash=grep {(eval {from_json($_->info)->{print_job_id}}//0)==$newid}
++      $db->resultset('Statistic')->search({action=>'PRINT_PAYMENT_CASH'})->all;
++  my @void=grep {(eval {from_json($_->info)->{print_job_id}}//0)==$newid}
++      $db->resultset('Statistic')->search({action=>'PRINT_PAYMENT_CASH_VOID'})->all;
++  is(scalar(@cash),$case eq 'fail'?2:1,'cash audited once per claimed attempt');
++  is(scalar(@void),$case eq 'fail'?1:0,'only known failure compensated');
++  my $net=0;$net+=from_json($_->info)->{amount} for @cash;
++  $net-=from_json($_->info)->{amount} for @void;
++  is(sprintf('%.2f',$net),$v{expected_amount},'one net cash charge');
++  is($db->resultset('Transaction')->count,0,'cash never debits patron account');
++ }}}
++};
++done_testing;
+diff --git a/t/utils_Printing-create_print_job_and_file.t b/t/utils_Printing-create_print_job_and_file.t
+index 94aa5b7..853c055 100644
+--- a/t/utils_Printing-create_print_job_and_file.t
++++ b/t/utils_Printing-create_print_job_and_file.t
+@@ -24,7 +24,7 @@ sub build_mock_c {
+         my $data = shift;
+         my $f = Test::MockObject->new();
+         $f->mock( 'id', sub { return 101; } );
+-        $f->mock( 'type', sub { return $data->{content_type}; } );
++        $f->mock( 'content_type', sub { return $data->{content_type}; } );
+         $f->mock( 'filename', sub { return $data->{filename}; } );
+         push @created_files, $data;
+         return $f;
+@@ -79,10 +79,13 @@ sub build_mock_c {
+ subtest 'Create print job logs statistic' => sub {
+     my ( $c, $stats, $files, $jobs ) = build_mock_c();
+ 
++    my $pdf = PDF::API2->new();
++    $pdf->page();
++    my $pdf_data = $pdf->to_string();
+     my $mock_file = Test::MockObject->new();
+-    $mock_file->mock( 'decoded_slurp', sub { return 'fake-data'; } );
+-    $mock_file->mock( 'filename', sub { return 'test.txt'; } );
+-    $mock_file->mock( 'type',     sub { return 'text/plain'; } );
++    $mock_file->mock( 'decoded_slurp', sub { return $pdf_data; } );
++    $mock_file->mock( 'filename', sub { return 'test.pdf'; } );
++    $mock_file->mock( 'type',     sub { return 'application/pdf'; } );
+ 
+     my $user_obj = Test::MockObject->new();
+     $user_obj->mock( 'id',       sub { return 1; } );
+@@ -105,7 +108,7 @@ subtest 'Create print job logs statistic' => sub {
+     is( $info->{print_job_id}, 501, 'Correct job ID in stat info' );
+     is( $info->{printer}, 'printer1', 'Correct printer name in stat info' );
+     is( $info->{copies}, 2, 'Correct copies in stat info' );
+-    is( $info->{filename}, 'test.txt', 'Correct filename in stat info' );
++    is( $info->{filename}, 'test.pdf', 'Correct filename in stat info' );
+ };
+ 
+ done_testing();
+diff --git a/t/utils_Printing-release.t b/t/utils_Printing-release.t
+index 2c669a9..2a90688 100644
+--- a/t/utils_Printing-release.t
++++ b/t/utils_Printing-release.t
+@@ -33,6 +33,9 @@ sub build_mock_c {
+         return $opts{print_job};
+     });
+ 
++    $print_job_rs->mock( 'search', sub { return $print_job_rs; } );
++    $print_job_rs->mock( 'update', sub { return 1; } );
++
+     # Mock print file result set
+     my $print_file_rs = Test::MockObject->new();
+     $print_file_rs->mock( 'find', sub {
+@@ -162,6 +165,7 @@ sub build_mock_print_job {
+ sub build_mock_print_file {
+     my (%opts) = @_;
+     my $pf = Test::MockObject->new();
++    $pf->mock( 'client_location', sub { return undef; } );
+     $pf->mock( 'id',       sub { return $opts{id}       // 100; } );
+     $pf->mock( 'pages',    sub { return $opts{pages}    // 5; } );
+     $pf->mock( 'filename', sub { return $opts{filename} // 'test.pdf'; } );
