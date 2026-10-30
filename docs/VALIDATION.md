@@ -13,7 +13,7 @@ Validation date: 2026-10-30. Results refer to the exact upstream baselines in [I
 - Template: the patched administration template parsed successfully with Template Toolkit.
 - Windows build: the public-baseline client plus indicator compiled and linked with Qt 5.5.1 and MinGW 4.9.2 under Wine. This is a compilation check, not a live Windows acceptance test.
 
-The screenshot in this repository is the patched dialog rendered with demonstration data. It does not show a real patron session.
+The original preview-dialog screenshot is rendered with demonstration data. Two additional screenshots, supplied from the existing deployment, show the staff action buttons (with patron details obscured) and an empty public-computer login screen inside the viewer. Those images document appearance and add no live acceptance-test results.
 
 ## Run the focused tests
 

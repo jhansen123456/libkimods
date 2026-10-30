@@ -17,6 +17,18 @@ Help a patron explain a problem by viewing their workstation from the Libki staf
 
 **Status: technical preview for evaluation.** This first package supports one configured workstation. It includes source patches, configuration examples, documentation, and automated tests. It is not an official Libki release or a ready-to-deploy Windows installer. Workstation consent and input restrictions must be configured and verified at the VNC server; the web application cannot enforce them by itself.
 
+### Screenshots from the deployed setup
+
+![Staff Sessions table showing the View screen action](docs/images/staff-sessions-view-screen.png)
+
+*The staff Sessions table places **View screen** beside **Modify time** and **Log out**. Patron names and card-number endings were obscured in the supplied image.*
+
+![Public computer login screen displayed inside the staff viewer](docs/images/public-computer-login-in-viewer.png)
+
+*The staff viewer displays the public computer's customized Libki login screen. The card-number field is empty.*
+
+These screenshots were supplied from the existing Clinton Public Library deployment. Its multiple enabled workstations, custom branding, login background, and other interface changes are not all included in this one-workstation public preview. The images illustrate appearance; they do not establish endpoint consent settings or replace the acceptance tests.
+
 ### Use it
 
 1. Read the [staff walkthrough](docs/STAFF-GUIDE.md).

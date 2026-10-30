@@ -13,6 +13,22 @@ The administrator first enables the feature for a workstation and configures its
 
 This image is the actual patched request dialog rendered with fictional data. It shows the proposed public version, not a live City workstation. Endpoint approval dialogs and the Windows indicator are not pictured here.
 
+## Screenshots from the deployed setup
+
+### Finding the View screen button
+
+![View screen buttons in the staff Sessions table](images/staff-sessions-view-screen.png)
+
+The **View screen** action appears beside **Modify time** and **Log out** in each enabled workstation's row. The supplied screenshot has patron names and card-number endings obscured.
+
+### Seeing the public computer's screen
+
+![Public computer login screen inside the staff screen viewer](images/public-computer-login-in-viewer.png)
+
+The public computer shows its customized Libki login page; the staff member sees that same screen inside the viewer window. The library-card input is empty in this example. **Close viewer** ends the browser connection.
+
+These are screenshots supplied from the existing Clinton Public Library deployment, rather than the synthetic preview dialog above. The deployed version enables multiple workstations and includes custom branding, a login background, and other interface changes beyond this public package. The preview currently supports one configured workstation. Neither screenshot demonstrates the approval prompt or the optional Windows connection indicator, and neither verifies endpoint security settings.
+
 ## What the patron sees
 
 If a Libki patron session exists, the client receives a notice explaining the request and reason. The independently configured VNC service presents its accept/reject prompt.
@@ -27,6 +43,6 @@ Store approved PNG files in **docs/images/**, then reference them with relative 
 ![Staff viewer after approval](images/staff-viewer-approved.png)
 ~~~
 
-For a real screenshot, use a demonstration workstation and a harmless sample application. Keep patron names, card numbers, email, documents, browser tabs, internal hostnames, network addresses, credentials, and access tokens out of the frame. Inspect the image and its metadata before committing it; deleting a file later does not remove it from Git history.
+For a real screenshot, use a demonstration workstation and a harmless sample application. Keep patron names, card numbers, email, documents, browser tabs, private infrastructure hostnames, network addresses, credentials, and access tokens out of the frame. Public-facing workstation labels and library branding may be included when intentionally approved for publication. Inspect the image and its metadata before committing it; deleting a file later does not remove it from Git history.
 
 Useful images are the **View screen** button, this request dialog, the workstation approval prompt, and the viewer displaying a demo screen. Describe each image with a short caption and accessible alt text. Label demonstration images clearly.
