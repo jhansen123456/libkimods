@@ -1,0 +1,285 @@
+diff --git a/Libki.pro b/Libki.pro
+index 544cba3..b18fd22 100644
+--- a/Libki.pro
++++ b/Libki.pro
+@@ -45,3 +45,8 @@ OTHER_FILES +=
+ 
+ DISTFILES += \
+     images/icons/libki.ico
++
++# Optional Windows screen-view connection indicator
++HEADERS += screenviewindicator.h
++SOURCES += screenviewindicator.cpp
++win32: LIBS += -liphlpapi -lws2_32
+diff --git a/main.cpp b/main.cpp
+index aa71fa1..4a2cd77 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -27,6 +27,7 @@
+ #include "loginwindow.h"
+ #include "logutils.h"
+ #include "networkclient.h"
++#include "screenviewindicator.h"
+ #include "timerwindow.h"
+ 
+ int main(int argc, char *argv[]) {
+@@ -127,6 +128,7 @@ int main(int argc, char *argv[]) {
+   LoginWindow *loginWindow = new LoginWindow();
+   TimerWindow *timerWindow = new TimerWindow();
+   NetworkClient *networkClient = new NetworkClient( &app );
++  ScreenViewIndicator screenViewIndicator;
+ 
+   QObject::connect(
+       loginWindow,
+diff --git a/screenviewindicator.cpp b/screenviewindicator.cpp
+new file mode 100644
+index 0000000..0714e8b
+--- /dev/null
++++ b/screenviewindicator.cpp
+@@ -0,0 +1,191 @@
++#ifdef _WIN32
++#ifndef _WIN32_WINNT
++#define _WIN32_WINNT 0x0600
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <winsock2.h>
++#include <windows.h>
++#include <iphlpapi.h>
++#endif
++
++#include "screenviewindicator.h"
++
++#include <QApplication>
++#include <QByteArray>
++#include <QDesktopWidget>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QSettings>
++#include <QTimer>
++#include <QVBoxLayout>
++
++ScreenViewIndicator::ScreenViewIndicator(QWidget *parent)
++    : QWidget(parent),
++      pollTimer(new QTimer(this)),
++      titleLabel(new QLabel(tr("SCREEN VIEW CONNECTION"), this)),
++      detailLabel(new QLabel(
++          tr("A screen-sharing connection is active. "
++             "Contact library staff if you did not request assistance."),
++          this)),
++      viewerPort(5901),
++      indicatorEnabled(false),
++      lastConnectionState(ViewerConnectionInactive) {
++  QSettings settings;
++  settings.setIniCodec("UTF-8");
++  indicatorEnabled =
++      settings.value("viewer_indicator/enabled", false).toBool();
++  int configuredPort =
++      settings.value("viewer_indicator/local_port", 5901).toInt();
++  if (configuredPort > 0 && configuredPort <= 65535) {
++    viewerPort = static_cast<quint16>(configuredPort);
++  }
++
++  setObjectName("screenViewIndicator");
++  setWindowFlags(Qt::Tool | Qt::FramelessWindowHint |
++                 Qt::WindowStaysOnTopHint);
++  setAttribute(Qt::WA_ShowWithoutActivating, true);
++  setAttribute(Qt::WA_TransparentForMouseEvents, true);
++  setFocusPolicy(Qt::NoFocus);
++
++  QLabel *statusDot = new QLabel(QString::fromUtf8("\xE2\x97\x8F"), this);
++  statusDot->setObjectName("screenViewStatusDot");
++  titleLabel->setObjectName("screenViewTitle");
++  detailLabel->setObjectName("screenViewDetail");
++  detailLabel->setWordWrap(true);
++
++  QVBoxLayout *textLayout = new QVBoxLayout();
++  textLayout->setContentsMargins(0, 0, 0, 0);
++  textLayout->setSpacing(2);
++  textLayout->addWidget(titleLabel);
++  textLayout->addWidget(detailLabel);
++
++  QHBoxLayout *layout = new QHBoxLayout(this);
++  layout->setContentsMargins(20, 10, 20, 10);
++  layout->setSpacing(14);
++  layout->addWidget(statusDot, 0, Qt::AlignVCenter);
++  layout->addLayout(textLayout, 1);
++
++  setStyleSheet(
++      "QWidget#screenViewIndicator {"
++      " background-color: #9f1f28;"
++      " border: 4px solid #ffca58;"
++      " border-radius: 10px;"
++      "}"
++      "QLabel#screenViewStatusDot {"
++      " color: #ffca58;"
++      " font-size: 24px;"
++      " font-weight: 700;"
++      "}"
++      "QLabel#screenViewTitle {"
++      " color: white;"
++      " font-size: 15px;"
++      " font-weight: 700;"
++      "}"
++      "QLabel#screenViewDetail {"
++      " color: white;"
++      " font-size: 10px;"
++      "}"
++  );
++
++  setMinimumHeight(72);
++  hide();
++
++  connect(pollTimer, SIGNAL(timeout()), this,
++          SLOT(refreshConnectionState()));
++  if (indicatorEnabled) {
++    pollTimer->start(750);
++    refreshConnectionState();
++  }
++}
++
++ScreenViewIndicator::~ScreenViewIndicator() {}
++
++void ScreenViewIndicator::refreshConnectionState() {
++  const ViewerConnectionState state = viewerConnectionState();
++
++  if (state == ViewerConnectionInactive) {
++    if (lastConnectionState != ViewerConnectionInactive) {
++      qDebug("Screen view indicator cleared");
++    }
++    lastConnectionState = state;
++    hide();
++    return;
++  }
++
++  if (state == ViewerConnectionActive) {
++    titleLabel->setText(tr("SCREEN VIEW CONNECTION"));
++    detailLabel->setText(
++        tr("A screen-sharing connection is active. "
++             "Contact library staff if you did not request assistance."));
++  } else {
++    titleLabel->setText(tr("SCREEN VIEW STATUS UNAVAILABLE"));
++    detailLabel->setText(
++        tr("Screen viewing status could not be checked. Contact library "
++           "staff or Information Technology."));
++  }
++
++  if (state == ViewerConnectionActive &&
++      lastConnectionState != ViewerConnectionActive) {
++    qDebug("Screen view indicator activated");
++  } else if (state == ViewerConnectionDetectionFailed &&
++             lastConnectionState != ViewerConnectionDetectionFailed) {
++    qWarning("Screen view indicator cannot query the Windows TCP table");
++  }
++  lastConnectionState = state;
++  positionBanner();
++  show();
++  keepBannerOnTop();
++}
++
++ScreenViewIndicator::ViewerConnectionState
++ScreenViewIndicator::viewerConnectionState() const {
++#ifdef Q_OS_WIN
++  DWORD tableSize = 0;
++  DWORD status = GetExtendedTcpTable(
++      NULL, &tableSize, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
++  if (status != ERROR_INSUFFICIENT_BUFFER || tableSize == 0) {
++    return ViewerConnectionDetectionFailed;
++  }
++
++  QByteArray tableBuffer(static_cast<int>(tableSize), 0);
++  PMIB_TCPTABLE_OWNER_PID table =
++      reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(tableBuffer.data());
++  status = GetExtendedTcpTable(
++      table, &tableSize, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
++  if (status != NO_ERROR) {
++    return ViewerConnectionDetectionFailed;
++  }
++
++  for (DWORD index = 0; index < table->dwNumEntries; ++index) {
++    const MIB_TCPROW_OWNER_PID &row = table->table[index];
++    const quint16 localPort =
++        static_cast<quint16>(ntohs(static_cast<u_short>(row.dwLocalPort)));
++    if (row.dwState == MIB_TCP_STATE_ESTAB && localPort == viewerPort) {
++      return ViewerConnectionActive;
++    }
++  }
++#endif
++
++  return ViewerConnectionInactive;
++}
++
++void ScreenViewIndicator::positionBanner() {
++  QDesktopWidget *desktop = QApplication::desktop();
++  QRect screen = desktop->screenGeometry(desktop->primaryScreen());
++  const int horizontalMargin = 24;
++  const int desiredWidth = 760;
++  const int availableWidth = qMax(320, screen.width() - horizontalMargin * 2);
++  setFixedWidth(qMin(desiredWidth, availableWidth));
++  adjustSize();
++  move(screen.left() + (screen.width() - width()) / 2, screen.top() + 12);
++}
++
++void ScreenViewIndicator::keepBannerOnTop() {
++  raise();
++#ifdef Q_OS_WIN
++  SetWindowPos(reinterpret_cast<HWND>(winId()), HWND_TOPMOST, 0, 0, 0, 0,
++               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
++#endif
++}
+diff --git a/screenviewindicator.h b/screenviewindicator.h
+new file mode 100644
+index 0000000..8de23f8
+--- /dev/null
++++ b/screenviewindicator.h
+@@ -0,0 +1,49 @@
++/*
++ * Copyright 2026 City of Clinton, Iowa
++ *
++ * This file is part of Libki.
++ *
++ * Libki is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef SCREENVIEWINDICATOR_H
++#define SCREENVIEWINDICATOR_H
++
++#include <QWidget>
++
++class QLabel;
++class QTimer;
++
++class ScreenViewIndicator : public QWidget {
++  Q_OBJECT
++
++ public:
++  explicit ScreenViewIndicator(QWidget *parent = 0);
++  ~ScreenViewIndicator();
++
++ private slots:
++  void refreshConnectionState();
++
++ private:
++  enum ViewerConnectionState {
++    ViewerConnectionInactive,
++    ViewerConnectionActive,
++    ViewerConnectionDetectionFailed
++  };
++
++  ViewerConnectionState viewerConnectionState() const;
++  void positionBanner();
++  void keepBannerOnTop();
++
++  QTimer *pollTimer;
++  QLabel *titleLabel;
++  QLabel *detailLabel;
++  quint16 viewerPort;
++  bool indicatorEnabled;
++  ViewerConnectionState lastConnectionState;
++};
++
++#endif  // SCREENVIEWINDICATOR_H

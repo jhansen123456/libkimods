@@ -1,0 +1,40 @@
+# Libki Mods
+
+Focused, reusable additions for [Libki Server](https://github.com/Libki/libki-server) and [Libki Client](https://github.com/Libki/libki-client).
+
+## First feature: staff screen viewer
+
+Help a patron explain a problem by viewing their workstation from the Libki staff page. Staff choose a reason, request access, and wait for someone at the workstation to approve the connection. The browser viewer is view-only.
+
+![Staff view-only request dialog with demonstration data](docs/images/staff-view-request-demo.png)
+
+*Actual patched dialog rendered with fictional workstation data. This is a demonstration, not a screenshot of a patron session.*
+
+- **Staff workflow:** a **View screen** button in the client and session tables, a reason selector, and an embedded noVNC viewer.
+- **Authorization and audit:** administrator and instance checks, same-origin request validation, a patron notice when a session exists, and a SCREEN_VIEW_REQUESTED audit event before issuing a token.
+- **Gateway:** short-lived signed tokens, one-use replay protection, and a fixed workstation target.
+- **Optional Windows client indicator:** a visible banner when an IPv4 connection is established on the configured VNC port.
+
+**Status: technical preview for evaluation.** This first package supports one configured workstation. It includes source patches, configuration examples, documentation, and automated tests. It is not an official Libki release or a ready-to-deploy Windows installer. Workstation consent and input restrictions must be configured and verified at the VNC server; the web application cannot enforce them by itself.
+
+### Use it
+
+1. Read the [staff walkthrough](docs/STAFF-GUIDE.md).
+2. Follow the [installation guide](docs/INSTALL.md), using the exact upstream commits listed there.
+3. Review [security boundaries](docs/SECURITY.md) and complete the [acceptance checklist](docs/VALIDATION.md) on an isolated workstation before deployment.
+
+| Component | What is included |
+| --- | --- |
+| Libki Server | [Server patch](patches/server-viewer.patch): token endpoint and staff UI |
+| Libki Client | [Client patch](patches/client-indicator.patch): optional Windows connection indicator |
+| WebSocket gateway | [Source and Docker build](gateway/) |
+| Deployment | [Examples](examples/), with documentation-only names and addresses |
+| Testing | [Regression tests](tests/) |
+
+These changes were developed for the City of Clinton, Iowa, and extracted onto clean public upstream baselines. This repository contains the selected feature, not the City's private Git history or deployment configuration.
+
+### Contributing upstream
+
+This is a standalone contribution package, not a GitHub fork of either upstream project. The server and client patches remain separate so they can become focused pull requests in their respective projects after maintainer feedback and workstation acceptance testing. See the [change description](docs/CHANGE-DESCRIPTION.md).
+
+See [licensing and attribution](LICENSE.md).

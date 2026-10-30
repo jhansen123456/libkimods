@@ -1,0 +1,613 @@
+diff --git a/lib/Libki.pm b/lib/Libki.pm
+index 0a7b9d2..8c55222 100644
+--- a/lib/Libki.pm
++++ b/lib/Libki.pm
+@@ -12,6 +12,7 @@ use DateTime::Format::DateParse;
+ use DateTime::Format::MySQL;
+ use DateTime;
+ use File::Slurp;
++use Libki::ScreenViewer qw(config_from_env);
+ 
+ our $VERSION = '5.4.0';
+ 
+@@ -159,6 +160,8 @@ __PACKAGE__->log(Log::Log4perl::Catalyst->new( \$log4perl ));
+ # Handle warnings from Perl as fatal log messages
+ $SIG{__WARN__} = sub { __PACKAGE__->log->fatal(@_); };
+ 
++__PACKAGE__->config( 'Libki::ScreenViewer' => config_from_env() );
++
+ # Start the application
+ __PACKAGE__->setup();
+ 
+diff --git a/lib/Libki/Controller/Administration.pm b/lib/Libki/Controller/Administration.pm
+index 9a43e1a..e6bbf5e 100644
+--- a/lib/Libki/Controller/Administration.pm
++++ b/lib/Libki/Controller/Administration.pm
+@@ -2,6 +2,7 @@ package Libki::Controller::Administration;
+ use Moose;
+ use namespace::autoclean;
+ use Scalar::Util qw(looks_like_number);
++use JSON qw(to_json);
+ 
+ BEGIN { extends 'Catalyst::Controller'; }
+ 
+@@ -42,6 +43,13 @@ sub index : Path : Args(0) {
+         }
+     )->get_column('type')->all();
+ 
++    my $viewer_config = $c->config->{'Libki::ScreenViewer'}
++        || { enabled => 0, clients => {} };
++    my $viewer_enabled = $viewer_config->{enabled}
++        && $c->instance eq ( $viewer_config->{instance} // q{} );
++    my @viewer_clients = $viewer_enabled
++        ? sort keys %{ $viewer_config->{clients} || {} } : ();
++
+     $c->stash(
+         DefaultTimeAllowance   => $c->setting('DefaultTimeAllowance'),
+         CustomJsAdministration => $c->setting('CustomJsAdministration'),
+@@ -51,6 +59,8 @@ sub index : Path : Args(0) {
+         GratisPrintingValue    => looks_like_number($c->setting('GratisPrintingValue')) ? $c->setting('GratisPrintingValue') : 0,
+         locations              => \@locations,
+         types                  => \@types,
++        ScreenViewerEnabled => $viewer_enabled ? 1 : 0,
++        ScreenViewerClientsJson => to_json(\@viewer_clients),
+     );
+ }
+ 
+diff --git a/lib/Libki/Controller/Administration/API/ScreenViewer.pm b/lib/Libki/Controller/Administration/API/ScreenViewer.pm
+new file mode 100644
+index 0000000..781d4a6
+--- /dev/null
++++ b/lib/Libki/Controller/Administration/API/ScreenViewer.pm
+@@ -0,0 +1,145 @@
++# SPDX-License-Identifier: AGPL-3.0-or-later
++# Copyright 2026 City of Clinton, Iowa
++package Libki::Controller::Administration::API::ScreenViewer;
++
++use Moose;
++use namespace::autoclean;
++
++use JSON qw(to_json);
++use Libki::ScreenViewer qw(mint_token normalize_reason);
++
++BEGIN { extends 'Catalyst::Controller'; }
++
++sub token : Path('token') : Args(0) {
++    my ( $self, $c ) = @_;
++
++    $self->_no_store($c);
++    return $self->_error( $c, 403, 'Staff administrator access is required' )
++        unless $c->user_exists && $c->check_user_roles('admin')
++            && $c->user->instance eq $c->instance;
++
++    return $self->_error( $c, 405, 'POST is required' )
++        unless uc( $c->request->method // q{} ) eq 'POST';
++
++    my $config = $c->config->{'Libki::ScreenViewer'} || { enabled => 0 };
++    return $self->_error( $c, 404, 'Screen viewing is not enabled' )
++        unless $config->{enabled};
++
++    return $self->_error( $c, 404, 'Screen viewing is not enabled for this instance' )
++        unless $c->instance eq $config->{instance};
++
++    # An explicit HTTPS origin avoids trusting forwarded Host headers.
++    # A cross-origin form cannot set X-Requested-With; do not enable CORS here.
++    return $self->_error( $c, 403, 'Same-origin viewer request is required' )
++        unless ($c->request->headers->header('Origin') // q{}) eq $config->{origin}
++            && ($c->request->headers->header('X-Requested-With') // q{}) eq 'XMLHttpRequest';
++
++    my $client_name = $c->request->params->{client} // q{};
++    return $self->_error( $c, 404, 'Screen viewing is not enabled for that client' )
++        unless $config->{clients}->{$client_name};
++
++    my $reason = eval {
++        normalize_reason( $c->request->params->{reason} );
++    };
++    return $self->_error( $c, 400, 'Select a valid reason for viewing this screen' )
++        unless $reason;
++
++    my $client = $c->model('DB::Client')->find(
++        {
++            instance => $c->instance,
++            name     => $client_name,
++        }
++    );
++    return $self->_error( $c, 404, 'Client was not found' ) unless $client;
++
++    my $staff_username = eval { $c->user->username } // 'unknown';
++    my $session = $client->session;
++    my $patron_notice_queued = 0;
++
++    if ($session) {
++        my $notice_created = eval {
++            $c->model('DB::Message')->create(
++                {
++                    content => join(
++                        q{ },
++                        'Library staff requested permission to view this screen for:',
++                        $reason->{label} . q{.},
++                        'The connection is view-only; staff cannot use your keyboard or mouse.',
++                        'Please accept or reject the connection prompt shown on this computer.',
++                    ),
++                    instance => $c->instance,
++                    user_id  => $session->user->id,
++                }
++            );
++            1;
++        };
++        return $self->_error( $c, 503, 'Unable to notify the active patron' )
++            unless $notice_created;
++        $patron_notice_queued = 1;
++    }
++
++    my $audit_created = eval {
++        $c->model('DB::Statistic')->create(
++            {
++                action      => 'SCREEN_VIEW_REQUESTED',
++                client_name => $client_name,
++                created_on  => $c->now,
++                info        => to_json(
++                    {
++                        endpoint_consent_required => 1,
++                        mode                      => 'view-only',
++                        patron_notice_queued      => $patron_notice_queued,
++                        reason                    => $reason->{code},
++                        reason_label              => $reason->{label},
++                        remote_address => $c->request->address // 'unknown',
++                    }
++                ),
++                instance   => $c->instance,
++                session_id => $c->sessionid,
++                username   => $staff_username,
++            }
++        );
++        1;
++    };
++    return $self->_error( $c, 503, 'Unable to record the screen-view audit event' )
++        unless $audit_created;
++
++    my $token = mint_token( $config, $client_name );
++
++    $c->stash(
++        {
++            client       => $client_name,
++            expires_in   => $config->{token_ttl},
++            endpoint_consent_required => 1,
++            mode         => 'view-only',
++            patron_notice_queued => $patron_notice_queued,
++            reason       => $reason->{code},
++            reason_label => $reason->{label},
++            token        => $token,
++            vnc_password => $config->{clients}->{$client_name}->{password},
++        }
++    );
++    $c->forward( $c->view('JSON') );
++}
++
++sub _error {
++    my ( $self, $c, $status, $message ) = @_;
++
++    $c->response->status($status);
++    $c->stash( { error => $message } );
++    $c->forward( $c->view('JSON') );
++    return;
++}
++
++sub _no_store {
++    my ( $self, $c ) = @_;
++
++    $c->response->headers->header( 'Cache-Control' => 'no-store, private' );
++    $c->response->headers->header( 'Pragma'        => 'no-cache' );
++    $c->response->headers->header( 'X-Content-Type-Options' => 'nosniff' );
++    $c->response->headers->header( 'Referrer-Policy' => 'no-referrer' );
++}
++
++__PACKAGE__->meta->make_immutable;
++
++1;
+diff --git a/lib/Libki/ScreenViewer.pm b/lib/Libki/ScreenViewer.pm
+new file mode 100644
+index 0000000..b332fc4
+--- /dev/null
++++ b/lib/Libki/ScreenViewer.pm
+@@ -0,0 +1,160 @@
++# SPDX-License-Identifier: AGPL-3.0-or-later
++# Copyright 2026 City of Clinton, Iowa
++package Libki::ScreenViewer;
++
++use strict;
++use warnings;
++
++use Carp qw(croak);
++use Digest::SHA qw(hmac_sha256_hex);
++use Exporter qw(import);
++
++our @EXPORT_OK = qw(config_from_env mint_token normalize_reason viewer_reasons);
++
++my @VIEWER_REASON_CODES = qw(
++    patron_assistance
++    technical_troubleshooting
++    policy_safety_review
++    accessibility_assistance
++);
++
++my %VIEWER_REASON_LABELS = (
++    patron_assistance         => 'Patron requested assistance',
++    technical_troubleshooting => 'Technical troubleshooting',
++    policy_safety_review      => 'Computer-use policy or safety review',
++    accessibility_assistance  => 'Accessibility assistance',
++);
++
++sub viewer_reasons {
++    return map {
++        {
++            code  => $_,
++            label => $VIEWER_REASON_LABELS{$_},
++        }
++    } @VIEWER_REASON_CODES;
++}
++
++sub normalize_reason {
++    my ($reason_code) = @_;
++
++    $reason_code //= q{};
++    croak 'a supported screen-view reason is required'
++        unless exists $VIEWER_REASON_LABELS{$reason_code};
++
++    return {
++        code  => $reason_code,
++        label => $VIEWER_REASON_LABELS{$reason_code},
++    };
++}
++
++sub config_from_env {
++    my ($env) = @_;
++    $env ||= \%ENV;
++
++    my $enabled = ( $env->{LIBKI_VIEWER_ENABLED} // q{} )
++        =~ /\A(?:1|true|yes|on)\z/i ? 1 : 0;
++
++    return { enabled => 0, clients => {} } unless $enabled;
++
++    for my $required (
++        qw/LIBKI_VIEWER_ORIGIN LIBKI_VIEWER_CLIENT_NAME LIBKI_VIEWER_HMAC_FILE LIBKI_VIEWER_PASSWORD_FILE/
++      )
++    {
++        croak "$required is required when LIBKI_VIEWER_ENABLED is true"
++            unless defined( $env->{$required} ) && $env->{$required} =~ /\S/;
++    }
++
++    my $instance = $env->{LIBKI_VIEWER_INSTANCE} // q{};
++    croak 'LIBKI_VIEWER_INSTANCE contains unsupported characters'
++        unless $instance =~ /\A[A-Za-z0-9_.-]{0,64}\z/;
++    my $origin = $env->{LIBKI_VIEWER_ORIGIN};
++    croak 'LIBKI_VIEWER_ORIGIN must be an HTTPS origin without a path'
++        unless $origin =~ m{\Ahttps://[A-Za-z0-9.-]+(?::[0-9]{1,5})?\z};
++    my $client_name = $env->{LIBKI_VIEWER_CLIENT_NAME};
++    croak 'LIBKI_VIEWER_CLIENT_NAME contains unsupported characters'
++        unless $client_name =~ /\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\z/;
++
++    my $hmac_secret = _read_secret(
++        $env->{LIBKI_VIEWER_HMAC_FILE},
++        'viewer HMAC secret',
++        32,
++        4096,
++    );
++    my $vnc_password = _read_secret(
++        $env->{LIBKI_VIEWER_PASSWORD_FILE},
++        'viewer VNC password',
++        6,
++        8,
++    );
++    croak 'viewer VNC password must contain printable non-whitespace ASCII only'
++        unless $vnc_password =~ /\A[!-~]{6,8}\z/;
++
++    return {
++        enabled     => 1,
++        origin      => $origin,
++        instance    => $instance,
++        hmac_secret => $hmac_secret,
++        token_ttl   => 60,
++        clients     => {
++            $client_name => {
++                password => $vnc_password,
++            },
++        },
++    };
++}
++
++sub mint_token {
++    my ( $config, $client_name, $now ) = @_;
++
++    croak 'screen viewer is not enabled'
++        unless $config && $config->{enabled};
++    croak 'screen viewer client is not allowed'
++        unless defined($client_name) && $config->{clients}->{$client_name};
++
++    $now = time() unless defined $now;
++    my $expires = int($now) + ( $config->{token_ttl} // 60 );
++    my $nonce   = unpack( 'H*', _secure_random(16) );
++    my $payload = join q{.}, $client_name, $expires, $nonce;
++    my $signature = hmac_sha256_hex( $payload, $config->{hmac_secret} );
++
++    return "$payload.$signature";
++}
++
++sub _read_secret {
++    my ( $path, $label, $minimum, $maximum ) = @_;
++
++    open my $fh, '<:raw', $path
++        or croak "cannot open $label file: $!";
++    local $/;
++    my $value = <$fh>;
++    close $fh or croak "cannot close $label file: $!";
++
++    $value //= q{};
++    $value =~ s/[\r\n]+\z//;
++    my $length = length($value);
++    croak "$label length is outside the allowed range"
++        if $length < $minimum || $length > $maximum;
++
++    return $value;
++}
++
++sub _secure_random {
++    my ($length) = @_;
++
++    open my $fh, '<:raw', '/dev/urandom'
++        or croak "cannot open operating-system random source: $!";
++    my $buffer = q{};
++    while ( length($buffer) < $length ) {
++        my $read = read $fh, my $chunk, $length - length($buffer);
++        croak "cannot read operating-system random source: $!"
++            unless defined $read;
++        croak 'operating-system random source returned no data'
++            if $read == 0;
++        $buffer .= $chunk;
++    }
++    close $fh or croak "cannot close operating-system random source: $!";
++
++    return $buffer;
++}
++
++1;
+diff --git a/root/dynamic/templates/administration/index.tt b/root/dynamic/templates/administration/index.tt
+index 40aeca1..35eff48 100644
+--- a/root/dynamic/templates/administration/index.tt
++++ b/root/dynamic/templates/administration/index.tt
+@@ -876,8 +876,61 @@
+   </div>
+ </div>
+ 
++[% IF ScreenViewerEnabled %]
++<div class="modal fade" id="screen-viewer-modal" tabindex="-1" role="dialog" aria-labelledby="screen-viewer-modal-label" aria-hidden="true">
++  <div class="modal-dialog modal-xl" role="document" style="max-width: 96vw;">
++    <div class="modal-content">
++      <div class="modal-header">
++        <div>
++          <h5 class="modal-title" id="screen-viewer-modal-label">
++            <i class="fas fa-eye"></i>
++            View screen: <span id="screen-viewer-client-name"></span>
++          </h5>
++          <div class="small text-muted">Live view only. The workstation must be configured to block remote input and file transfers.</div>
++        </div>
++        <button type="button" class="close" data-dismiss="modal" aria-label="Close">
++          <span aria-hidden="true">&times;</span>
++        </button>
++      </div>
++      <div class="modal-body p-0 bg-dark">
++        <div id="screen-viewer-request-controls" class="p-4 bg-white text-dark">
++          <div class="form-group mb-3">
++            <label for="screen-viewer-reason"><strong>Reason for viewing</strong></label>
++            <select id="screen-viewer-reason" class="form-control" required>
++              <option value="">Select a reason&hellip;</option>
++              <option value="patron_assistance">Patron requested assistance</option>
++              <option value="technical_troubleshooting">Technical troubleshooting</option>
++              <option value="policy_safety_review">Computer-use policy or safety review</option>
++              <option value="accessibility_assistance">Accessibility assistance</option>
++            </select>
++            <small class="form-text text-muted">The selected reason and signed-in staff identity are written to the Libki audit history.</small>
++          </div>
++          <div class="alert alert-warning" role="note">
++            <i class="fas fa-user-shield"></i>
++            The workstation will notify the active patron and require someone at the computer to accept the connection. No response is treated as a rejection.
++          </div>
++          <button type="button" class="btn btn-info" id="screen-viewer-request-button">
++            <i class="fas fa-eye"></i> Request view-only access
++          </button>
++        </div>
++        <div id="screen-viewer-status" class="alert alert-info m-3" role="status" style="display: none;"></div>
++        <div id="screen-viewer-canvas" style="display: none; height: 72vh; width: 100%; overflow: hidden; background: #111;"></div>
++      </div>
++      <div class="modal-footer justify-content-between">
++        <span class="small text-muted"><i class="fas fa-shield-alt"></i> This browser is view-only. Workstation permissions are enforced by its configured VNC service.</span>
++        <button type="button" class="btn btn-secondary" data-dismiss="modal">Close viewer</button>
++      </div>
++    </div>
++  </div>
++</div>
++[% END %]
++
+ <script type="text/javascript">
+ $(document).ready(function() {
++    const screenViewerClients = new Set([% ScreenViewerClientsJson %]);
++    let activeScreenViewer = null;
++    let pendingScreenViewerClient = null;
++
+     /**** Handle refreshing of tables ****/
+     // Refresh the client and print jobs tables automatically, as its date will go stale quickly
+     sessionRefreshCounter = setInterval( function(){HandleSessionTableRefreshCounter()}, 1000 );
+@@ -1048,9 +1101,14 @@ $(document).ready(function() {
+                 render: function(data,type,row) {
+                     const client_id = row["id"];
+                     const client_name = row["name"];
++                    const viewerButton = screenViewerClients.has(client_name)
++                        ? `<button class="client-screen-viewer btn btn-info" data-clientname="${client_name}"><i class="fas fa-eye"></i> View screen</button>`
++                        : '';
++
+ 
+                     let html = `<div id="client-table-row-toolbar"  role="toolbar">
+                         <div class="btn-group" role="group">
++                        ${viewerButton}
+ 
+                 [% IF Settings.ClientBehavior.match("RES") # Setting supports reservations %]
+                 <button class="client-table-row-toolbar-reserve btn btn-primary" data-clientid="${client_id}" data-clientname="${client_name}"><i class="fas fa-tag"></i> [% c.loc("Reserve") %]</button>
+@@ -1139,9 +1197,15 @@ $(document).ready(function() {
+                 render: function(data,type,row) {
+                     const session_id = row["id"];
+                     const client_id = row["client_id"];
++                    const client_name = row["client"];
++                    const viewerButton = screenViewerClients.has(client_name)
++                        ? `<button class="client-screen-viewer btn btn-info" data-clientname="${client_name}"><i class="fas fa-eye"></i> View screen</button>`
++                        : '';
++
+ 
+                     let html = `<div id="client-table-row-toolbar"  role="toolbar">
+                         <div class="btn-group" role="group">
++                        ${viewerButton}
+ 
+                         <button class="client-table-row-toolbar-time btn btn-primary" data-sessionid="${session_id}"><i class="fas fa-clock"></i> [% c.loc("Modify time") %]</button>
+ 
+@@ -1659,6 +1723,142 @@ $(document).ready(function() {
+     });
+ 
+     /*********** Client Table ***********/
++    let screenViewerGeneration = 0;
++    let screenViewerAbort = null;
++    function cancelScreenViewer() {
++        ++screenViewerGeneration;
++        if (screenViewerAbort) screenViewerAbort.abort();
++        screenViewerAbort = null;
++        const oldViewer = activeScreenViewer;
++        activeScreenViewer = null;
++        if (oldViewer) oldViewer.disconnect();
++    }
++
++    function prepareScreenViewer(clientName) {
++        if (!screenViewerClients.has(clientName)) {
++            DisplayMessage('error', 'Screen viewing is not enabled for this client.');
++            return;
++        }
++
++        cancelScreenViewer();
++
++        const modal = $('#screen-viewer-modal');
++        pendingScreenViewerClient = clientName;
++        $('#screen-viewer-client-name').text(clientName);
++        $('#screen-viewer-reason').val('').removeClass('is-invalid');
++        $('#screen-viewer-request-button').prop('disabled', false);
++        $('#screen-viewer-request-controls').show();
++        $('#screen-viewer-status').hide();
++        document.getElementById('screen-viewer-canvas').style.display = 'none';
++        document.getElementById('screen-viewer-canvas').replaceChildren();
++        modal.modal('show');
++    }
++
++    async function startScreenViewer(clientName, reasonCode) {
++        if (!screenViewerClients.has(clientName)) {
++            DisplayMessage('error', 'Screen viewing is not enabled for this client.');
++            return;
++        }
++
++        cancelScreenViewer();
++        const generation = screenViewerGeneration;
++        screenViewerAbort = new AbortController();
++        const status = $('#screen-viewer-status');
++        const canvas = document.getElementById('screen-viewer-canvas');
++        $('#screen-viewer-request-controls').hide();
++        $('#screen-viewer-request-button').prop('disabled', true);
++        canvas.style.display = 'block';
++        status.removeClass('alert-success alert-danger').addClass('alert-info').text('Notifying the patron and preparing a secure view-only connection…').show();
++        canvas.replaceChildren();
++
++        try {
++            const response = await fetch('[% c.uri_for('/administration/api/screenviewer/token') %]', {
++                method: 'POST',
++                signal: screenViewerAbort.signal,
++                credentials: 'same-origin',
++                headers: {
++                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
++                    'X-Requested-With': 'XMLHttpRequest'
++                },
++                body: new URLSearchParams({client: clientName, reason: reasonCode}).toString()
++            });
++            const data = await response.json();
++            if (generation !== screenViewerGeneration) return;
++            if (!response.ok) {
++                throw new Error(data.error || `Viewer request failed (${response.status})`);
++            }
++
++            const module = await import('/static/vendor/novnc/core/rfb.js');
++            if (generation !== screenViewerGeneration) return;
++            if (window.location.protocol !== 'https:') throw new Error('HTTPS is required for screen viewing.');
++            const scheme = 'wss';
++            const websocketUrl = `${scheme}://${window.location.host}/screen-viewer/ws?token=${encodeURIComponent(data.token)}`;
++            const rfb = new module.default(canvas, websocketUrl, {
++                credentials: { password: data.vnc_password },
++                shared: true
++            });
++
++            // Defense in depth: TightVNC blocks remote input at the workstation;
++            // noVNC independently suppresses keyboard and pointer events here.
++            rfb.viewOnly = true;
++            rfb.focusOnClick = false;
++            rfb.scaleViewport = true;
++            rfb.resizeSession = false;
++            rfb.showDotCursor = false;
++            activeScreenViewer = rfb;
++            status.text('Waiting for someone at the workstation to accept the view-only connection…');
++
++            rfb.addEventListener('connect', function() {
++                if (generation !== screenViewerGeneration) return;
++                status.removeClass('alert-info alert-danger').addClass('alert-success').text('Connected — live view only.').delay(1800).fadeOut();
++            });
++            rfb.addEventListener('disconnect', function(event) {
++                if (generation !== screenViewerGeneration) return;
++                if (activeScreenViewer === rfb) {
++                    activeScreenViewer = null;
++                }
++                if (event.detail.clean) {
++                    status.removeClass('alert-info alert-danger').addClass('alert-success').text('Viewer disconnected.').show();
++                } else {
++                    status.removeClass('alert-info alert-success').addClass('alert-danger').text('The view-only connection ended unexpectedly.').show();
++                }
++            });
++            rfb.addEventListener('securityfailure', function() {
++                if (generation !== screenViewerGeneration) return;
++                status.removeClass('alert-info alert-success').addClass('alert-danger').text('The workstation rejected the view-only credential.').show();
++            });
++        } catch (error) {
++            if (generation !== screenViewerGeneration) return;
++            status.removeClass('alert-info alert-success').addClass('alert-danger').text(error.message || 'Unable to open the view-only connection.').show();
++        }
++    }
++
++    $('#client-table, #session-table').on('click', '.client-screen-viewer', function(event) {
++        event.preventDefault();
++        prepareScreenViewer($(this).data('clientname'));
++    });
++
++    $('#screen-viewer-request-button').on('click', function() {
++        const reasonCode = $('#screen-viewer-reason').val();
++        if (!reasonCode) {
++            $('#screen-viewer-reason').addClass('is-invalid').focus();
++            return;
++        }
++        $('#screen-viewer-reason').removeClass('is-invalid');
++        startScreenViewer(pendingScreenViewerClient, reasonCode);
++    });
++
++    $('#screen-viewer-modal').on('hide.bs.modal', function() {
++        cancelScreenViewer();
++        pendingScreenViewerClient = null;
++        $('#screen-viewer-request-controls').show();
++        $('#screen-viewer-status').hide();
++        const canvas = document.getElementById('screen-viewer-canvas');
++        canvas.style.display = 'none';
++        canvas.replaceChildren();
++    });
++
++
+     /* Modify Time */
+     $('#modify-time-modal-form-submit').click(function(){
+         var errors = false;
