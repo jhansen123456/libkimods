@@ -2,6 +2,10 @@
 
 Focused, reusable additions for [Libki Server](https://github.com/Libki/libki-server) and [Libki Client](https://github.com/Libki/libki-client).
 
+## Configurable client welcome screen
+
+[See the welcome-screen contribution and five native client screenshots](contributions/client-welcome-screen/README.md). It adds rotating artwork and large FAQ/policy buttons, with configurable pictures, rotation timing, library text, links, and local policy files. Includes an upstream-based source patch, sample assets, setup instructions, and native regression tests. Published here for review; no upstream client PR or production deployment yet.
+
 ## Staff Microsoft Entra single sign-on
 
 [Review the Entra contribution](contributions/staff-entra-sso/README.md), including its source patch, setup instructions, dependencies, and tests. This is the same sanitized version submitted in [upstream draft PR #507](https://github.com/Libki/libki-server/pull/507). It adds optional Microsoft sign-in for staff and leaves patron authentication unchanged. Live Entra acceptance testing is still required for this portable export.

@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Adapted from the Clinton Public Library Libki welcome-screen modifications.
+#include "welcomescreen.h"
+#include <QApplication>
+#include <QDialog>
+#include <QDir>
+#include <QEvent>
+#include <QFile>
+#include <QFileInfo>
+#include <QGridLayout>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkCookieJar>
+#include <QNetworkCookie>
+#include <QWebHistory>
+#include <QNetworkRequest>
+#include <QPushButton>
+#include <QSettings>
+#include <QTextBrowser>
+#include <QTimer>
+#include <QToolButton>
+#include <QVBoxLayout>
+#include <QWebFrame>
+#include <QWebPage>
+#include <QWebSettings>
+#include <QWebView>
+
+// Informational pages never retain or send cookies between patrons.
+class WelcomeCookies : public QNetworkCookieJar {
+ public:
+  explicit WelcomeCookies(QObject *parent) : QNetworkCookieJar(parent) {}
+  QList<QNetworkCookie> cookiesForUrl(const QUrl &) const { return QList<QNetworkCookie>(); }
+  bool setCookiesFromUrl(const QList<QNetworkCookie> &, const QUrl &) { return false; }
+};
+
+// Applies to every subresource and redirect, not just clicked hyperlinks.
+class WelcomeNetwork : public QNetworkAccessManager {
+ public:
+  WelcomeNetwork(const QStringList &origins, QObject *parent)
+      : QNetworkAccessManager(parent), origins(origins) { setCookieJar(new WelcomeCookies(this)); }
+ protected:
+  QNetworkReply *createRequest(Operation op, const QNetworkRequest &request,
+                              QIODevice *data = 0) {
+    if (op != GetOperation || !WelcomeScreen::allowedUrl(request.url(), origins)) {
+      // Qt reports an unsupported protocol; no network or file access occurs.
+      return QNetworkAccessManager::createRequest(
+          GetOperation, QNetworkRequest(QUrl("welcome-blocked:")), 0);
+    }
+    return QNetworkAccessManager::createRequest(op, request, data);
+  }
+ private:
+  QStringList origins;
+};
+
+class WelcomePage : public QWebPage {
+ public:
+  WelcomePage(const QStringList &origins, QObject *parent)
+      : QWebPage(parent), origins(origins) {}
+ protected:
+  bool acceptNavigationRequest(QWebFrame *, const QNetworkRequest &r, NavigationType type) {
+    return type != NavigationTypeFormSubmitted &&
+           type != NavigationTypeFormResubmitted &&
+           WelcomeScreen::allowedUrl(r.url(), origins);
+  }
+  QWebPage *createWindow(WebWindowType) { return 0; }
+  QString chooseFile(QWebFrame *, const QString &) { return QString(); }
+ private:
+  QStringList origins;
+};
+
+// Local information pages cannot load remote or local-file subresources.
+class WelcomeText : public QTextBrowser {
+ public:
+  explicit WelcomeText(QWidget *parent) : QTextBrowser(parent) {}
+ protected:
+  QVariant loadResource(int, const QUrl &) { return QVariant(); }
+};
+
+bool WelcomeScreen::allowedUrl(const QUrl &url, const QStringList &origins) {
+  if (!url.isValid() || url.scheme().toLower() != "https" ||
+      url.host().isEmpty() || !url.userInfo().isEmpty()) return false;
+  for (int i = 0; i < origins.size(); ++i) {
+    QUrl allowed(origins.at(i).trimmed());
+    if (allowed.isValid() && allowed.scheme().toLower() == "https" &&
+        allowed.userInfo().isEmpty() &&
+        (allowed.path().isEmpty() || allowed.path() == "/") &&
+        !allowed.hasQuery() && !allowed.hasFragment() &&
+        url.host().toLower() == allowed.host().toLower() &&
+        url.port(443) == allowed.port(443)) return true;
+  }
+  return false;
+}
+
+QString WelcomeScreen::localFile(const QString &name) const {
+  if (name.trimmed().isEmpty() || QDir::isAbsolutePath(name)) return QString();
+  // Canonical paths also reject symlinks escaping the configuration directory.
+  QString root = QFileInfo(directory).canonicalFilePath();
+  QString path = QFileInfo(QDir(directory).filePath(name)).canonicalFilePath();
+  if (root.isEmpty() || path.isEmpty() || !path.startsWith(root + "/") ||
+      !QFileInfo(path).isFile()) return QString();
+  return path;
+}
+
+WelcomeScreen::WelcomeScreen(QWidget *surface, QGridLayout *layout,
+                             const QString &configFile, QObject *parent)
+    : QObject(parent), surface(surface), panel(0), background(0), timer(0),
+      dialog(0), text(0), web(0), dialogTitle(0), status(0), returnButton(0),
+      current(0), enabled(false) {
+  if (configFile.isEmpty() || !QFileInfo(configFile).isFile()) return;
+  directory = QFileInfo(configFile).absolutePath();
+  QSettings settings(configFile, QSettings::IniFormat);
+  settings.setIniCodec("UTF-8");
+  if (!settings.value("welcome/enabled", false).toBool()) return;
+  enabled = true;
+  QFile styleFile(localFile(settings.value("welcome/style_file").toString()));
+  if (styleFile.open(QIODevice::ReadOnly) && styleFile.size() <= 131072)
+    surface->setStyleSheet(QString::fromUtf8(styleFile.readAll()));
+  QStringList configured = settings.value("welcome/images").toStringList();
+  for (int i = 0; i < qMin(configured.size(), 50); ++i) {
+    QString path = localFile(configured.at(i).trimmed());
+    QPixmap pixmap(path);
+    if (!path.isEmpty() && !pixmap.isNull()) images << path;
+  }
+  origins = settings.value("welcome/allowed_origins").toStringList();
+  background = new QLabel(surface);
+  background->setObjectName("welcomeBackground");
+  background->setAttribute(Qt::WA_TransparentForMouseEvents);
+  surface->installEventFilter(this);
+  timer = new QTimer(this);
+  timer->setObjectName("welcomeRotationTimer");
+  connect(timer, SIGNAL(timeout()), this, SLOT(advanceBackground()));
+  bool validInterval = false;
+  int seconds = settings.value("welcome/rotation_seconds", 180).toString().toInt(&validInterval);
+  if (!validInterval || seconds < 0 || seconds > 86400) seconds = 180;
+  if (seconds > 0 && seconds < 5) seconds = 5;
+  timer->setInterval(seconds * 1000);
+  if (seconds > 0 && images.size() > 1) timer->start();
+
+  panel = new QWidget(surface);
+  panel->setObjectName("welcomePanel");
+  QVBoxLayout *outer = new QVBoxLayout(panel);
+  outer->setContentsMargins(24, 12, 24, 12);
+  outer->setSpacing(12);
+  QWidget *header = new QWidget(panel);
+  header->setObjectName("welcomeHeader");
+  QHBoxLayout *headerLayout = new QHBoxLayout(header);
+  QLabel *brand = new QLabel(header);
+  QPixmap logo(localFile(settings.value("welcome/logo").toString()));
+  if (!logo.isNull()) {
+    brand->setPixmap(logo.scaled(100, 64, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    headerLayout->addWidget(brand);
+  } else { brand->hide(); }
+  QLabel *title = new QLabel(settings.value("welcome/title", tr("Welcome to your library")).toString(), header);
+  title->setTextFormat(Qt::PlainText);
+  title->setWordWrap(true);
+  title->setObjectName("welcomeTitle");
+  headerLayout->addWidget(title, 1);
+  QLabel *subtitle = new QLabel(settings.value("welcome/subtitle", tr("Discover. Learn. Connect.")).toString(), header);
+  subtitle->setTextFormat(Qt::PlainText);
+  subtitle->setWordWrap(true);
+  subtitle->setObjectName("welcomeSubtitle");
+  subtitle->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  headerLayout->addWidget(subtitle, 1);
+  outer->addWidget(header);
+  QGridLayout *tiles = new QGridLayout;
+  tiles->setSpacing(12);
+  int count = qMin(settings.beginReadArray("resources"), 8);
+  for (int i = 0; i < count; ++i) {
+    settings.setArrayIndex(i);
+    WelcomeResource resource;
+    resource.title = settings.value("title", tr("Library information")).toString();
+    resource.file = localFile(settings.value("content_file").toString());
+    resource.icon = localFile(settings.value("icon").toString());
+    resource.url = QUrl(settings.value("url").toString());
+    if (resource.file.isEmpty() && !allowedUrl(resource.url, origins)) continue;
+    resources.append(resource);
+    QToolButton *button = new QToolButton(panel);
+    button->setObjectName(QString("welcomeResource%1").arg(resources.size()-1));
+    button->setProperty("resourceIndex", resources.size()-1);
+    button->setProperty("tileColor", i % 4);
+    button->setText(resource.title);
+    button->setIcon(QIcon(resource.icon));
+    button->setIconSize(QSize(30, 30));
+    button->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+    button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    button->setMinimumHeight(82);
+    button->setCursor(Qt::PointingHandCursor);
+    connect(button, SIGNAL(clicked()), this, SLOT(resourceClicked()));
+    tiles->addWidget(button, (resources.size()-1)/4, (resources.size()-1)%4);
+  }
+  settings.endArray();
+  outer->addLayout(tiles);
+  panel->setStyleSheet(
+      "QWidget {font-family:Arial;}"
+      "#welcomeHeader {background:#19324e; border-radius:8px;}"
+      "#welcomeTitle {color:white;font-size:24px;font-weight:bold;padding:12px;}"
+      "#welcomeSubtitle {color:#dce7f2;font-size:16px;padding:12px;}"
+      "QToolButton {background:#28577b;color:white;border:2px solid #446e8c;"
+      "border-radius:7px;padding:10px;font-size:16px;font-weight:bold;}"
+      "QToolButton[tileColor=\"1\"] {background:#a6383c;border-color:#bd5558;}"
+      "QToolButton[tileColor=\"2\"] {background:#b76222;border-color:#c97e47;}"
+      "QToolButton[tileColor=\"3\"] {background:#237475;border-color:#3c8b8c;}"
+      "QToolButton:hover,QToolButton:focus {border:2px solid white;}");
+  layout->addWidget(panel, 0, 0, 1, layout->columnCount());
+  layout->setRowStretch(0, 0);
+  paintBackground();
+}
+
+int WelcomeScreen::intervalMilliseconds() const { return timer ? timer->interval() : 0; }
+QString WelcomeScreen::currentImage() const { return images.isEmpty() ? QString() : images.at(current); }
+
+void WelcomeScreen::paintBackground() {
+  if (!background || images.isEmpty()) return;
+  QSize size = surface->size();
+  if (size.width() < 1 || size.height() < 1) return;
+  QPixmap source(images.at(current));
+  if (source.isNull()) return;
+  QPixmap scaled = source.scaled(size, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+  background->setGeometry(surface->rect());
+  background->setPixmap(scaled.copy(qMax(0,(scaled.width()-size.width())/2),
+                                   qMax(0,(scaled.height()-size.height())/2),
+                                   size.width(), size.height()));
+  background->lower();
+  background->show();
+}
+void WelcomeScreen::advanceBackground() {
+  if (images.size() < 2) return;
+  current = (current + 1) % images.size();
+  paintBackground();
+}
+bool WelcomeScreen::eventFilter(QObject *object, QEvent *event) {
+  if (object == surface && event->type() == QEvent::Resize) paintBackground();
+  if (object == surface && event->type() == QEvent::Hide) {
+    if (dialog) dialog->close();
+    if (timer) timer->stop();
+  }
+  if (object == surface && event->type() == QEvent::Show &&
+      timer && timer->interval() > 0 && images.size() > 1) timer->start();
+  return QObject::eventFilter(object, event);
+}
+void WelcomeScreen::resourceClicked() {
+  QToolButton *button = qobject_cast<QToolButton *>(sender());
+  if (!button) return;
+  // QToolButton is not a QPushButton; restore focus using its resource index.
+  openResource(button->property("resourceIndex").toInt());
+}
+void WelcomeScreen::openResource(int index) {
+  if (index < 0 || index >= resources.size()) return;
+  if (!dialog) {
+    dialog = new QDialog(surface->window());
+    dialog->setObjectName("welcomeInformation");
+    dialog->setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+    dialog->setModal(true);
+    QVBoxLayout *layout = new QVBoxLayout(dialog);
+    layout->setContentsMargins(26, 22, 26, 22);
+    QHBoxLayout *header = new QHBoxLayout;
+    dialogTitle = new QLabel(dialog);
+    dialogTitle->setTextFormat(Qt::PlainText);
+    dialogTitle->setObjectName("welcomeInformationTitle");
+    header->addWidget(dialogTitle, 1);
+    returnButton = new QPushButton(tr("Back to information"), dialog);
+    connect(returnButton, SIGNAL(clicked()), this, SLOT(backToInformation()));
+    returnButton->hide();
+    header->addWidget(returnButton);
+    QPushButton *close = new QPushButton(tr("Close"), dialog);
+    close->setObjectName("welcomeInformationClose");
+    connect(close, SIGNAL(clicked()), this, SLOT(closeResource()));
+    header->addWidget(close);
+    layout->addLayout(header);
+    text = new WelcomeText(dialog);
+    text->setObjectName("welcomePolicyText");
+    text->setOpenLinks(false);
+    text->setOpenExternalLinks(false);
+    connect(text, SIGNAL(anchorClicked(QUrl)), this, SLOT(openLink(QUrl)));
+    layout->addWidget(text, 1);
+    web = new QWebView(dialog);
+    web->setObjectName("welcomeLinkedPage");
+    web->setContextMenuPolicy(Qt::NoContextMenu);
+    web->setAcceptDrops(false);
+    WelcomePage *page = new WelcomePage(origins, web);
+    web->setPage(page);
+    page->setNetworkAccessManager(new WelcomeNetwork(origins, page));
+    page->setLinkDelegationPolicy(QWebPage::DelegateAllLinks);
+    QWebSettings *options = web->settings();
+    options->setAttribute(QWebSettings::JavascriptEnabled, false);
+    options->setAttribute(QWebSettings::PluginsEnabled, false);
+    options->setAttribute(QWebSettings::JavascriptCanOpenWindows, false);
+    options->setAttribute(QWebSettings::LocalStorageEnabled, false);
+    options->setAttribute(QWebSettings::OfflineWebApplicationCacheEnabled, false);
+    options->setAttribute(QWebSettings::LocalContentCanAccessRemoteUrls, false);
+    options->setAttribute(QWebSettings::LocalContentCanAccessFileUrls, false);
+    options->setAttribute(QWebSettings::PrivateBrowsingEnabled, true);
+    connect(web, SIGNAL(linkClicked(QUrl)), this, SLOT(openLink(QUrl)));
+    connect(web, SIGNAL(loadFinished(bool)), this, SLOT(pageLoaded(bool)));
+    connect(dialog, SIGNAL(finished(int)), this, SLOT(clearWebState()));
+    layout->addWidget(web, 1);
+    status = new QLabel(dialog);
+    status->setTextFormat(Qt::PlainText);
+    status->setWordWrap(true);
+    layout->addWidget(status);
+    dialog->setStyleSheet(
+        "QDialog {font-family:Arial;background:#f7f9fc;color:#19324e;}"
+        "#welcomeInformationTitle {font-size:26px;font-weight:bold;padding:10px;}"
+        "QTextBrowser {background:white;border:1px solid #d4dee8;padding:22px;font-size:18px;}"
+        "QPushButton {background:#19324e;color:white;border:2px solid #19324e;"
+        "border-radius:5px;padding:12px 22px;font-size:16px;}"
+        "QPushButton:focus {border-color:#b76222;}");
+  }
+  const WelcomeResource &resource = resources.at(index);
+  dialog->setProperty("resourceIndex", index);
+  dialogTitle->setText(resource.title);
+  status->clear();
+  returnButton->hide();
+  web->stop();
+  web->hide();
+  text->show();
+  QFile file(resource.file);
+  if (!resource.file.isEmpty() && file.open(QIODevice::ReadOnly) && file.size() <= 1048576) {
+    text->setHtml(QString::fromUtf8(file.readAll()));
+  } else if (resource.file.isEmpty() && allowedUrl(resource.url, origins)) {
+    openLink(resource.url);
+  } else {
+    text->setPlainText(tr("This information is unavailable. Please ask library staff."));
+  }
+  QRect area = surface->window()->geometry();
+  dialog->setGeometry(area.adjusted(40, 40, -40, -40));
+  dialog->show();
+  dialog->raise();
+  dialog->findChild<QPushButton *>("welcomeInformationClose")->setFocus();
+}
+void WelcomeScreen::openLink(const QUrl &url) {
+  if (!allowedUrl(url, origins)) {
+    status->setText(tr("This link is not enabled for the welcome screen."));
+    return;
+  }
+  status->setText(tr("Library website: ") + url.host());
+  text->hide();
+  web->show();
+  returnButton->setVisible(!resources.at(dialog->property("resourceIndex").toInt()).file.isEmpty());
+  web->load(url);
+}
+void WelcomeScreen::closeResource() {
+  if (web) web->stop();
+  if (dialog) {
+    dialog->close();
+    int index = dialog->property("resourceIndex").toInt();
+    QToolButton *button = panel->findChild<QToolButton *>(QString("welcomeResource%1").arg(index));
+    if (button) button->setFocus();
+  }
+}
+
+void WelcomeScreen::backToInformation() {
+  if (dialog) openResource(dialog->property("resourceIndex").toInt());
+}
+void WelcomeScreen::pageLoaded(bool ok) {
+  if (!ok && web && web->isVisible())
+    status->setText(tr("The website could not be loaded. Please ask library staff."));
+}
+
+void WelcomeScreen::clearWebState() {
+  if (!web) return;
+  web->stop();
+  web->setHtml(QString());
+  web->history()->clear();
+  web->hide();
+}

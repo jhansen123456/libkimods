@@ -1,0 +1,10 @@
+QWidget { font-family: Arial; }
+QLabel { color: #19324e; font-family: Arial; font-size: 15px; }
+QLabel#messageLabel { background: rgba(255,255,255,225); border-radius: 6px; padding: 12px; font-size: 18px; }
+QLabel#usernameLabel, QLabel#passwordLabel { background: rgba(255,255,255,230); padding: 10px; border-radius: 4px; }
+QLineEdit { background: white; color: #19324e; border: 2px solid #6d9599; border-radius: 5px; min-width: 260px; padding: 12px; font-size: 18px; }
+QLineEdit:focus { border-color: #b76222; }
+QPushButton#loginButton, QPushButton#cancelButton, QPushButton#loginGuestButton { background: #19324e; color: white; border: 2px solid #19324e; border-radius: 5px; padding: 10px; font-size: 17px; }
+QPushButton#loginButton:focus, QPushButton#cancelButton:focus { border-color: #b76222; }
+QLabel#reservedLabel, QLabel#serverAccessWarning, QLabel#internetAccessWarning { background: white; color: #a12930; padding: 8px; }
+QLabel#errorLabel { color: #a12930; font-weight: bold; }
